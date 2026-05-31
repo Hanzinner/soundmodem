@@ -59,9 +59,9 @@ const GAP = 0.4;                               // тиша в кінці
 
 const stat = (s, cls) => { const e = document.getElementById('stat'); e.textContent = s; e.className = 'stat' + (cls ? ' ' + cls : ''); };
 
-// ---------- АВТО-ТЕЛЕМЕТРІЯ (поки ВИМКНЕНА — чекає вибору релею від Hanz) ----------
-const TELE = "";   // коли Hanz підтвердить релей -> сюди топік ntfy / власний endpoint
-function tele(title, body){ if(!TELE) return; try{ fetch('https://ntfy.sh/'+TELE, {method:'POST', headers:{'Title':title, 'Tags':'sound'}, body:String(body).slice(0,800)}); }catch(e){} }
+// ---------- АВТО-ТЕЛЕМЕТРІЯ: дебаг-ЦИФРИ (без тексту) -> ntfy, Hanz обрав топік ----------
+const TELE = "hanz-soundmodem-x7k92q";   // читати: curl -s https://ntfy.sh/hanz-soundmodem-x7k92q/json?poll=1
+function tele(title, body){ if(!TELE) return; try{ fetch('https://ntfy.sh/'+TELE, {method:'POST', headers:{'Title':title, 'Tags':'sound'}, body:String(body).slice(0,400)}); }catch(e){} }
 
 // ---------- байти <-> біти <-> символи ----------
 function bytesToBits(bytes){ const b=[]; for(const by of bytes) for(let i=0;i<8;i++) b.push((by>>i)&1); return b; }
@@ -115,7 +115,7 @@ document.getElementById('send').onclick = async () => {
     const ab = ctx.createBuffer(1, pcm.length, sr); ab.getChannelData(0).set(pcm);
     const src = ctx.createBufferSource(); src.buffer=ab; src.connect(ctx.destination); src.start();
     stat(`граю ${(pcm.length/sr).toFixed(1)}с — ${bytes.length}B …`);
-    tele('TX', `граю ${bytes.length}B, ${(pcm.length/sr).toFixed(1)}с, sr=${sr} | "${txt.slice(0,80)}"`);
+    tele('TX', `граю ${bytes.length}B, ${(pcm.length/sr).toFixed(1)}с, sr=${sr}`);
     src.onended = ()=> stat('відіграв.', 'ok');
   }catch(e){ stat('TX помилка: '+e.message,'err'); }
 };
@@ -177,7 +177,7 @@ function decode(rec, sr){
   let txt=''; try{ txt=new TextDecoder().decode(data); }catch(e){ txt='[не-текст, '+dlen+'B]'; }
   document.getElementById('out').textContent = txt;
   stat(okCrc ? `✓ ЦІЛЕ (CRC ок, ${dlen}B)` : `⚠ прийшло з помилками (CRC не зійшовся, ${dlen}B) — потрібен RS`, okCrc?'ok':'err');
-  tele(okCrc?'RX OK':'RX ERR', `crc=${okCrc} len=${dlen} sync=${bestv.toFixed(1)} sr=${sr} rec=${(rec.length/sr).toFixed(1)}с | "${txt.slice(0,150)}"`);
+  tele(okCrc?'RX OK':'RX ERR', `crc=${okCrc} len=${dlen} sync=${bestv.toFixed(1)} sr=${sr} rec=${(rec.length/sr).toFixed(1)}с`);
 }
 </script>
 </body>
