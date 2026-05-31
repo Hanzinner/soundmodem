@@ -26,7 +26,7 @@
 </style>
 </head>
 <body>
-  <h1>HANZ SOUND MODEM <span style="color:#555">web v0.1</span></h1>
+  <h1>HANZ SOUND MODEM <span style="color:#555">web v0.2 чирп</span></h1>
   <p class="sub">текст → звук → текст. OFDM-OOK, когерентний декод. два телефони або один loopback.</p>
 
   <div class="lbl">ПЕРЕДАТИ</div>
@@ -48,7 +48,9 @@
 <script>
 "use strict";
 // ---------- КОНФІГ (дзеркало Python-логіки, спрощено під браузер) ----------
-const PRE_F = 1500, PRE_DUR = 0.20;            // маячок: тон не з набору несучих
+const PRE_F0 = 1200, PRE_F1 = 3800, PRE_DUR = 0.20;   // маячок = ЧИРП (свіп частоти): гострий пік кореляції, надійний синк
+function chirpRef(sr){ const m=Math.round(sr*PRE_DUR), a=new Float32Array(m), k=(PRE_F1-PRE_F0)/PRE_DUR;
+  for(let i=0;i<m;i++){ const t=i/sr; a[i]=Math.sin(2*Math.PI*(PRE_F0*t+0.5*k*t*t)); } return a; }
 const BIT = 0.045, FADE = 0.12;                // такт повільніший за десктоп (динаміки/мік телефону)
 // несучі: безпечна середня смуга де телефонні динамік+мік чисті
 const FREQS = []; for (let f = 1000; f <= 3600; f += 200) FREQS.push(f);   // 14 несучих = 14 біт/символ
@@ -56,6 +58,10 @@ const NCAR = FREQS.length;
 const GAP = 0.4;                               // тиша в кінці
 
 const stat = (s, cls) => { const e = document.getElementById('stat'); e.textContent = s; e.className = 'stat' + (cls ? ' ' + cls : ''); };
+
+// ---------- АВТО-ТЕЛЕМЕТРІЯ (поки ВИМКНЕНА — чекає вибору релею від Hanz) ----------
+const TELE = "";   // коли Hanz підтвердить релей -> сюди топік ntfy / власний endpoint
+function tele(title, body){ if(!TELE) return; try{ fetch('https://ntfy.sh/'+TELE, {method:'POST', headers:{'Title':title, 'Tags':'sound'}, body:String(body).slice(0,800)}); }catch(e){} }
 
 // ---------- байти <-> біти <-> символи ----------
 function bytesToBits(bytes){ const b=[]; for(const by of bytes) for(let i=0;i<8;i++) b.push((by>>i)&1); return b; }
@@ -79,8 +85,8 @@ function buildSignal(bytes, sr){
   const preN = Math.round(sr*PRE_DUR);
   const total = preN + n /*calib*/ + nSym*n + Math.round(sr*GAP);
   const buf = new Float32Array(total);
-  // маячок
-  for (let i=0;i<preN;i++) buf[i] = 0.6*Math.sin(2*Math.PI*PRE_F*i/sr);
+  // маячок = чирп
+  const ch = chirpRef(sr); for (let i=0;i<preN;i++) buf[i] = 0.6*ch[i];
   // огинаюча символу
   const env = new Float32Array(n).fill(1);
   for (let i=0;i<fade;i++){ env[i]=i/fade; env[n-1-i]=i/fade; }
@@ -109,6 +115,7 @@ document.getElementById('send').onclick = async () => {
     const ab = ctx.createBuffer(1, pcm.length, sr); ab.getChannelData(0).set(pcm);
     const src = ctx.createBufferSource(); src.buffer=ab; src.connect(ctx.destination); src.start();
     stat(`граю ${(pcm.length/sr).toFixed(1)}с — ${bytes.length}B …`);
+    tele('TX', `граю ${bytes.length}B, ${(pcm.length/sr).toFixed(1)}с, sr=${sr} | "${txt.slice(0,80)}"`);
     src.onended = ()=> stat('відіграв.', 'ok');
   }catch(e){ stat('TX помилка: '+e.message,'err'); }
 };
@@ -142,12 +149,18 @@ document.getElementById('stop').onclick = async () => {
 
 // ---------- декод ----------
 function decode(rec, sr){
-  const n=Math.round(sr*BIT), preN=Math.round(sr*PRE_DUR);
-  // маячок: кореляція з еталоном
-  const pre=new Float32Array(preN); for(let i=0;i<preN;i++) pre[i]=Math.sin(2*Math.PI*PRE_F*i/sr);
+  const n=Math.round(sr*BIT);
+  // маячок-чирп: НОРМОВАНА matched-filter кореляція (|dot|/√енергія) -> рівне-незалежний гострий пік
+  const ch=chirpRef(sr), preN=ch.length;
+  const ps=new Float64Array(rec.length+1); for(let i=0;i<rec.length;i++) ps[i+1]=ps[i]+rec[i]*rec[i];
   let best=-1, bestv=-1; const lim=rec.length-preN-NCAR*n-n;
-  for(let p=0;p<lim;p++){ let s=0; for(let i=0;i<preN;i+=4) s+=rec[p+i]*pre[i]; s=Math.abs(s); if(s>bestv){bestv=s; best=p;} }
-  if(best<0){ stat('маячок не знайдено — тихо/далеко?','err'); return; }
+  if(lim<=0){ stat('запис закороткий — записуй довше.','err'); return; }
+  for(let p=0;p<lim;p+=2){ let s=0; for(let i=0;i<preN;i+=2) s+=rec[p+i]*ch[i];
+    const e=ps[p+preN]-ps[p], sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0; if(sc>bestv){bestv=sc; best=p;} }
+  // уточнити ±2 (бо крок 2)
+  for(let p=Math.max(0,best-2);p<=best+2&&p<lim;p++){ let s=0; for(let i=0;i<preN;i++) s+=rec[p+i]*ch[i];
+    const e=ps[p+preN]-ps[p], sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0; if(sc>bestv){bestv=sc; best=p;} }
+  if(best<0){ stat('маячок не знайдено — тихо/далеко?','err'); tele('RX-нема-синку', `rec=${(rec.length/sr).toFixed(1)}с sr=${sr}`); return; }
   const calibAt = best+preN, dataAt = calibAt+n;
   // фаза+рівень кожної несучої з калібру
   const ph=new Array(NCAR), lvl=new Array(NCAR);
@@ -158,12 +171,13 @@ function decode(rec, sr){
   // розпарсити кадр
   const head=bitsToBytes(bits.slice(0,64),8); const dv=new DataView(head.buffer);
   const dlen=dv.getUint32(0,true), dcrc=dv.getUint32(4,true);
-  if(dlen<=0||dlen>100000){ stat('кадр не розпізнано (синк/шум). спробуй ближче/гучніше.','err'); return; }
+  if(dlen<=0||dlen>100000){ stat('кадр не розпізнано (синк/шум). спробуй ближче/гучніше.','err'); tele('RX-кадр-битий', `sync=${bestv.toFixed(1)} dlen=${dlen} rec=${(rec.length/sr).toFixed(1)}с sr=${sr}`); return; }
   const data=bitsToBytes(bits.slice(64,64+dlen*8), dlen);
   const okCrc = crc32(data)===dcrc;
   let txt=''; try{ txt=new TextDecoder().decode(data); }catch(e){ txt='[не-текст, '+dlen+'B]'; }
   document.getElementById('out').textContent = txt;
   stat(okCrc ? `✓ ЦІЛЕ (CRC ок, ${dlen}B)` : `⚠ прийшло з помилками (CRC не зійшовся, ${dlen}B) — потрібен RS`, okCrc?'ok':'err');
+  tele(okCrc?'RX OK':'RX ERR', `crc=${okCrc} len=${dlen} sync=${bestv.toFixed(1)} sr=${sr} rec=${(rec.length/sr).toFixed(1)}с | "${txt.slice(0,150)}"`);
 }
 </script>
 </body>
