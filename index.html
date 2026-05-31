@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Hanz Sound Modem</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; font-family: ui-monospace, Menlo, Consolas, monospace; background:#0b0b0c; color:#e6e6e6; padding:14px; }
+  h1 { font-size:16px; letter-spacing:.5px; margin:0 0 4px; }
+  .sub { color:#888; font-size:12px; margin:0 0 14px; }
+  textarea, .out { width:100%; background:#141417; color:#e6e6e6; border:1px solid #2a2a30; border-radius:10px; padding:10px; font:inherit; font-size:14px; }
+  textarea { height:90px; resize:vertical; }
+  .out { min-height:70px; white-space:pre-wrap; word-break:break-word; }
+  .row { display:flex; gap:8px; margin:10px 0; flex-wrap:wrap; }
+  button { flex:1 1 0; min-width:120px; padding:14px; border:0; border-radius:10px; font:inherit; font-size:15px; font-weight:600; background:#2563eb; color:#fff; }
+  button.alt { background:#374151; }
+  button.rec { background:#dc2626; }
+  button:active { opacity:.7; }
+  button:disabled { opacity:.4; }
+  .lbl { color:#888; font-size:12px; margin:14px 0 4px; }
+  .stat { color:#9ca3af; font-size:12px; margin-top:8px; min-height:16px; }
+  .ok { color:#22c55e; } .err { color:#ef4444; }
+  meter { width:100%; height:10px; }
+</style>
+</head>
+<body>
+  <h1>HANZ SOUND MODEM <span style="color:#555">web v0.1</span></h1>
+  <p class="sub">текст → звук → текст. OFDM-OOK, когерентний декод. два телефони або один loopback.</p>
+
+  <div class="lbl">ПЕРЕДАТИ</div>
+  <textarea id="msg" placeholder="напиши повідомлення…">hanz beer</textarea>
+  <div class="row">
+    <button id="send">▶ ГРАТИ ЗВУК</button>
+  </div>
+
+  <div class="lbl">ПРИЙНЯТИ (другий телефон, або цей же)</div>
+  <div class="row">
+    <button id="listen" class="alt">● СЛУХАТИ</button>
+    <button id="stop" class="rec" disabled>■ СТОП + ДЕКОД</button>
+  </div>
+  <meter id="vu" min="0" max="0.3" value="0"></meter>
+  <div class="lbl">ОТРИМАНО</div>
+  <div class="out" id="out"></div>
+  <div class="stat" id="stat">готовий. дай дозвіл на мікрофон коли спитає.</div>
+
+<script>
+"use strict";
+// ---------- КОНФІГ (дзеркало Python-логіки, спрощено під браузер) ----------
+const PRE_F = 1500, PRE_DUR = 0.20;            // маячок: тон не з набору несучих
+const BIT = 0.045, FADE = 0.12;                // такт повільніший за десктоп (динаміки/мік телефону)
+// несучі: безпечна середня смуга де телефонні динамік+мік чисті
+const FREQS = []; for (let f = 1000; f <= 3600; f += 200) FREQS.push(f);   // 14 несучих = 14 біт/символ
+const NCAR = FREQS.length;
+const GAP = 0.4;                               // тиша в кінці
+
+const stat = (s, cls) => { const e = document.getElementById('stat'); e.textContent = s; e.className = 'stat' + (cls ? ' ' + cls : ''); };
+
+// ---------- байти <-> біти <-> символи ----------
+function bytesToBits(bytes){ const b=[]; for(const by of bytes) for(let i=0;i<8;i++) b.push((by>>i)&1); return b; }
+function bitsToBytes(bits, nbytes){ const o=new Uint8Array(nbytes); for(let j=0;j<nbytes;j++){ let v=0; for(let i=0;i<8;i++){ const k=j*8+i; if(k<bits.length&&bits[k]) v|=(1<<i);} o[j]=v;} return o; }
+
+// CRC32 — щоб бачити чи прийшло цілим (поки без FEC; RS додамо наступним кроком)
+function crc32(bytes){ let c=~0; for(const b of bytes){ c^=b; for(let k=0;k<8;k++) c=(c>>>1)^(0xEDB88320&-(c&1)); } return (~c)>>>0; }
+
+// ---------- TX: побудувати PCM ----------
+function buildSignal(bytes, sr){
+  const n = Math.round(sr*BIT), fade = Math.max(4, Math.round(FADE*n));
+  // кадр: [4 байти довжини][4 байти crc][дані]
+  const head = new Uint8Array(8); const dv = new DataView(head.buffer);
+  dv.setUint32(0, bytes.length, true); dv.setUint32(4, crc32(bytes), true);
+  const payload = new Uint8Array(head.length + bytes.length); payload.set(head,0); payload.set(bytes,8);
+
+  let bits = bytesToBits(payload); while (bits.length % NCAR) bits.push(0);
+  const nSym = bits.length / NCAR;
+
+  // преамбл + калібр(усі несучі ON) + символи
+  const preN = Math.round(sr*PRE_DUR);
+  const total = preN + n /*calib*/ + nSym*n + Math.round(sr*GAP);
+  const buf = new Float32Array(total);
+  // маячок
+  for (let i=0;i<preN;i++) buf[i] = 0.6*Math.sin(2*Math.PI*PRE_F*i/sr);
+  // огинаюча символу
+  const env = new Float32Array(n).fill(1);
+  for (let i=0;i<fade;i++){ env[i]=i/fade; env[n-1-i]=i/fade; }
+  // одна нота на частку амплітуди
+  const addSym = (off, onMask) => {
+    for (let i=0;i<n;i++){ let w=0; for(let c=0;c<NCAR;c++) if(onMask[c]) w+=Math.sin(2*Math.PI*FREQS[c]*i/sr); buf[off+i] += (w/NCAR)*env[i]; }
+  };
+  // калібр = усі ON (для фази+рівня)
+  const allOn = new Array(NCAR).fill(1); addSym(preN, allOn);
+  // дані
+  for (let s=0;s<nSym;s++){ const mask=new Array(NCAR); for(let c=0;c<NCAR;c++) mask[c]=bits[s*NCAR+c]; addSym(preN+n+s*n, mask); }
+  // нормалізація до 0.9
+  let pk=0; for(let i=0;i<total;i++) pk=Math.max(pk,Math.abs(buf[i])); if(pk>0){ const g=0.9/pk; for(let i=0;i<total;i++) buf[i]*=g; }
+  return buf;
+}
+
+let actx=null;
+async function getCtx(){ if(!actx) actx=new (window.AudioContext||window.webkitAudioContext)(); if(actx.state==='suspended') await actx.resume(); return actx; }
+
+document.getElementById('send').onclick = async () => {
+  try{
+    const ctx = await getCtx(); const sr = ctx.sampleRate;
+    const txt = document.getElementById('msg').value;
+    const bytes = new TextEncoder().encode(txt);
+    const pcm = buildSignal(bytes, sr);
+    const ab = ctx.createBuffer(1, pcm.length, sr); ab.getChannelData(0).set(pcm);
+    const src = ctx.createBufferSource(); src.buffer=ab; src.connect(ctx.destination); src.start();
+    stat(`граю ${(pcm.length/sr).toFixed(1)}с — ${bytes.length}B …`);
+    src.onended = ()=> stat('відіграв.', 'ok');
+  }catch(e){ stat('TX помилка: '+e.message,'err'); }
+};
+
+// ---------- RX: запис ----------
+let rxBuf=[], rxSR=44100, recStream=null, recNode=null, recCtx=null;
+document.getElementById('listen').onclick = async () => {
+  try{
+    recStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
+    recCtx = new (window.AudioContext||window.webkitAudioContext)(); rxSR = recCtx.sampleRate; rxBuf=[];
+    const src = recCtx.createMediaStreamSource(recStream);
+    recNode = recCtx.createScriptProcessor(4096,1,1);
+    recNode.onaudioprocess = (e)=>{ const d=e.inputBuffer.getChannelData(0); rxBuf.push(new Float32Array(d));
+      let pk=0; for(let i=0;i<d.length;i++) pk=Math.max(pk,Math.abs(d[i])); document.getElementById('vu').value=pk; };
+    src.connect(recNode); recNode.connect(recCtx.destination);
+    document.getElementById('listen').disabled=true; document.getElementById('stop').disabled=false;
+    stat('слухаю… натисни СТОП коли передача завершиться.');
+  }catch(e){ stat('мік недоступний: '+e.message,'err'); }
+};
+
+document.getElementById('stop').onclick = async () => {
+  try{
+    if(recNode) recNode.disconnect(); if(recStream) recStream.getTracks().forEach(t=>t.stop());
+    document.getElementById('listen').disabled=false; document.getElementById('stop').disabled=true;
+    document.getElementById('vu').value=0;
+    let len=0; for(const c of rxBuf) len+=c.length; const rec=new Float32Array(len); let o=0; for(const c of rxBuf){ rec.set(c,o); o+=c.length; }
+    stat(`записав ${(len/rxSR).toFixed(1)}с, декодую…`);
+    setTimeout(()=>decode(rec, rxSR), 30);
+  }catch(e){ stat('RX помилка: '+e.message,'err'); }
+};
+
+// ---------- декод ----------
+function decode(rec, sr){
+  const n=Math.round(sr*BIT), preN=Math.round(sr*PRE_DUR);
+  // маячок: кореляція з еталоном
+  const pre=new Float32Array(preN); for(let i=0;i<preN;i++) pre[i]=Math.sin(2*Math.PI*PRE_F*i/sr);
+  let best=-1, bestv=-1; const lim=rec.length-preN-NCAR*n-n;
+  for(let p=0;p<lim;p++){ let s=0; for(let i=0;i<preN;i+=4) s+=rec[p+i]*pre[i]; s=Math.abs(s); if(s>bestv){bestv=s; best=p;} }
+  if(best<0){ stat('маячок не знайдено — тихо/далеко?','err'); return; }
+  const calibAt = best+preN, dataAt = calibAt+n;
+  // фаза+рівень кожної несучої з калібру
+  const ph=new Array(NCAR), lvl=new Array(NCAR);
+  for(let c=0;c<NCAR;c++){ let I=0,Q=0; for(let i=0;i<n;i++){ const t=2*Math.PI*FREQS[c]*(calibAt+i)/sr; I+=rec[calibAt+i]*Math.sin(t); Q+=rec[calibAt+i]*Math.cos(t);} ph[c]=Math.atan2(Q,I); lvl[c]=Math.hypot(I,Q); }
+  // декод символів: когерентна проєкція > половини калібр-рівня
+  const nSymMax=Math.floor((rec.length-dataAt)/n); const bits=[];
+  for(let s=0;s<nSymMax;s++){ const off=dataAt+s*n; for(let c=0;c<NCAR;c++){ let d=0; for(let i=0;i<n;i++){ const t=2*Math.PI*FREQS[c]*(off+i)/sr; d+=rec[off+i]*(Math.cos(ph[c])*Math.sin(t)+Math.sin(ph[c])*Math.cos(t)); } bits.push(d>lvl[c]*0.5?1:0); } }
+  // розпарсити кадр
+  const head=bitsToBytes(bits.slice(0,64),8); const dv=new DataView(head.buffer);
+  const dlen=dv.getUint32(0,true), dcrc=dv.getUint32(4,true);
+  if(dlen<=0||dlen>100000){ stat('кадр не розпізнано (синк/шум). спробуй ближче/гучніше.','err'); return; }
+  const data=bitsToBytes(bits.slice(64,64+dlen*8), dlen);
+  const okCrc = crc32(data)===dcrc;
+  let txt=''; try{ txt=new TextDecoder().decode(data); }catch(e){ txt='[не-текст, '+dlen+'B]'; }
+  document.getElementById('out').textContent = txt;
+  stat(okCrc ? `✓ ЦІЛЕ (CRC ок, ${dlen}B)` : `⚠ прийшло з помилками (CRC не зійшовся, ${dlen}B) — потрібен RS`, okCrc?'ok':'err');
+}
+</script>
+</body>
+</html>
