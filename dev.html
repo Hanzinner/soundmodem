@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.21 (здача зразка = локальне скачування + чесний статус ntfy; квота ntfy більше не бреше «долетіло»)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.22 (ФІКС: error-гейт NaN з v0.18 — CAND.map(c) брав частоту як індекс err[], NaN глушив ВСЕ. Тепер 89 несучих)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -381,7 +381,7 @@ function applyProbe(rec,sr,silLen){
   for(let s=0;s<NTR;s++){const off=trainAt+s*nn; if(off+nn>rec.length)break; trDone++;
     for(let c=0;c<CAND.length;c++){let I=0,Q=0;for(let i=0;i<nn;i++){const t=2*Math.PI*CAND[c]*i/sr;I+=rec[off+i]*Math.sin(t);Q+=rec[off+i]*Math.cos(t);}
       const bit=Math.hypot(I,Q)>0.5*lv[c]?1:0; if(bit!==probeBit(s*CAND.length+c)) err[c]++; }}
-  const errRate=CAND.map(c=>trDone?err[c]/trDone:1);
+  const errRate=CAND.map((f,c)=>trDone?err[c]/trDone:1);   // c=ІНДЕКС (не частота!): err[] індексований 0..n. Був баг CAND.map(c=>err[c]) -> err[1500]=undef -> NaN -> NaN<=0.35 false -> глушило ВСЕ з v0.18
   // ГЕЙТ: SNR≥4 ТА ПОМИЛКА≤35%. БЕЗ рівневого гейту 0.20*maxLv — він був killer-ом:
   // канал гостро-резонансний (1-2кГц = 50%+ енергії), maxLv сідає на пік, чисті несучі в 5× слабші
   // викидались дарма. Симуляція на реальних зразках: 0.20*maxLv різав 93/99 на тихому каналі
