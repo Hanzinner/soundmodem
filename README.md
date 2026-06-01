@@ -100,7 +100,9 @@ pass 1 recovered 31/58, pass 2 recovered the remaining 27 → file identical, 56
 | `python/arq_sim.py` | hardware-free convergence test (mocked channel) |
 | `python/offline_forensics.py` | clock-drift / timing analysis on a real recording |
 | `python/offline_decode.py` | full decode replay on a real recording with timing sweep |
-| `index.html` | browser port (Web Audio API) for phones — GitHub Pages |
+| `index.html` | browser port (Web Audio API) for phones — stable page |
+| `dev.html` | browser port with full Reed-Solomon + block ARQ (under test) — see [WEB.md](WEB.md) |
+| `rs.js` | Node-testable Reed-Solomon codec (inlined into `dev.html`) |
 
 ## Run (desktop)
 
@@ -113,6 +115,15 @@ python3 python/loopback_arq.py
 It plays sound, records itself, and writes `output.*` next to the input. They should match.
 
 > Note: put **one** `input.*` file in the io folder — newest wins.
+
+## Browser / phone version
+
+There is also a browser port that runs on a phone (Web Audio, no install). It ports the same
+architecture with the divergences forced by two-device physics (OOK instead of phase modulation,
+narrower band, ARQ by replay). It has its own Reed-Solomon codec and block accumulation.
+
+See **[WEB.md](WEB.md)** for the full write-up. Files: `index.html` (stable page),
+`dev.html` (full RS + ARQ, under test), `rs.js` (Node-testable RS codec).
 
 ---
 
