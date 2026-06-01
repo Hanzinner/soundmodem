@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.22 (ФІКС: error-гейт NaN з v0.18 — CAND.map(c) брав частоту як індекс err[], NaN глушив ВСЕ. Тепер 89 несучих)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.23 (здача зразка несе meta.json з точними FREQS/NCAR -> офлайн відтворення декоду; BTN-спам вимкнено щоб не палити квоту ntfy)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -151,7 +151,7 @@ function shortUA(){
   let br=/Firefox/.test(UA)?'FF':/Edg/.test(UA)?'Edge':/Chrome/.test(UA)?'Chrome':/Safari/.test(UA)?'Safari':'?';
   return os+'/'+br;
 }
-function btn(name){tele('BTN',`${name} | ${MODE} | ${shortUA()}`);}   // які кнопки + пристрій
+function btn(name){}   // BTN-телеметрія вимкнена: подія-на-клік випалювала денну квоту ntfy. Важливе йде через TX/RX/PROBE/SAMPLE.
 
 /* ============================ біти/crc ============================ */
 function bytesToBits(b){const o=[];for(const by of b)for(let i=0;i<8;i++)o.push((by>>i)&1);return o;}
@@ -492,7 +492,7 @@ document.getElementById('send').onclick=async()=>{
 };
 
 /* ============================ RX ============================ */
-let rxBuf=[], rxSR=44100, recStream=null, recNode=null, recCtx=null, lastRec=null;
+let rxBuf=[], rxSR=44100, recStream=null, recNode=null, recCtx=null, lastRec=null, LASTDIAG='';
 document.getElementById('listen').onclick=async()=>{
   btn('СЛУХАТИ');
   try{
@@ -526,15 +526,18 @@ document.getElementById('sample').onclick=async()=>{
   const maxS=Math.min(pcm.length, sr*15);                 // до 15с (ліміт вкладення ~2МБ)
   const i16=new Int16Array(maxS);
   for(let i=0;i<maxS;i++){const v=Math.round(pcm[i]*32767);i16[i]=v>32767?32767:(v<-32768?-32768:v);}
-  const fname=`sample_sr${sr}_${(VERSION.match(/v[0-9.]+/)||['v?'])[0]}_${MODE}_${shortUA().replace('/','-')}.pcm16`;
-  stat(`здаю зразок ${(maxS/sr).toFixed(1)}с (${Math.round(i16.byteLength/1024)}КБ)…`);
-  // 1) НАДІЙНО: локальне скачування (не б'є жодну квоту). Кидаєш файл у Syncthing-папку -> прилітає розробнику.
+  const base=`sample_sr${sr}_${(VERSION.match(/v[0-9.]+/)||['v?'])[0]}_${MODE}_${shortUA().replace('/','-')}`;
+  const fname=base+'.pcm16';
+  // META: точний стан декодера -> офлайн відтворення байт-у-байт (FREQS критичні: без них NCAR не вгадати)
+  const meta={version:VERSION,sr,mode:MODE,BIT:cfg().BIT,parity:cfg().parity,NCAR,CAND_HI,probed:PROBED,
+    FREQS:Array.from(FREQS),GTX:GTX?Array.from(GTX).map(x=>+x.toFixed(3)):null,lastDiag:LASTDIAG,sampleSec:+(maxS/sr).toFixed(2)};
+  function dl(blob,name){const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);}
+  stat(`здаю зразок ${(maxS/sr).toFixed(1)}с (${Math.round(i16.byteLength/1024)}КБ) + meta…`);
+  // 1) НАДІЙНО: локальне скачування .pcm16 + .meta.json (не б'є жодну квоту). Обидва -> Syncthing-папка.
   try{
-    const blob=new Blob([i16.buffer],{type:'application/octet-stream'});
-    const url=URL.createObjectURL(blob); const a=document.createElement('a');
-    a.href=url; a.download=fname; document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(()=>URL.revokeObjectURL(url),2000);
-    document.getElementById('sampleinfo').textContent=`⬇ ${fname} скачано (${(maxS/sr).toFixed(1)}с) — кинь у Syncthing-папку`;
+    dl(new Blob([i16.buffer],{type:'application/octet-stream'}),fname);
+    dl(new Blob([JSON.stringify(meta,null,1)],{type:'application/json'}),base+'.meta.json');
+    document.getElementById('sampleinfo').textContent=`⬇ ${fname} + .meta.json скачано (${meta.NCAR} несучих) — кинь ОБИДВА у Syncthing-папку`;
   }catch(e){ document.getElementById('sampleinfo').textContent='скачування не вдалось: '+e.message; }
   // 2) ДОДАТКОВО: ntfy (якщо квота жива) — тепер з ПЕРЕВІРКОЮ реального статусу, без брехні
   try{
@@ -572,6 +575,7 @@ async function processRec(rec,sr){
   const sSig=specSig(rec,sr);
   // АУДІОСИГНАТУРА: дає ПОВНУ картину каналу навіть коли 0 блоків
   const sig=`${VERSION}|${cfg().name} ${shortUA()} sr=${sr} dur=${dur}s pk=${peak.toFixed(3)} chirps=${peaks.length} blkB=${recv.chunk||'?'} sync=[${syncTop}] blk=${have}/${tot||'?'} +${newOk} fail=${fails} rsErr~${avgErr} | carr=${cSig} | spec=${sSig}`;
+  LASTDIAG=sig;   // для meta.json при здачі зразка — щоб офлайн відтворити декод точно
   const asm=tryAssemble();
   if(asm&&!asm.bad){
     finish(asm);
