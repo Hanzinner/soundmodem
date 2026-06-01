@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.19 (probe фікс: м'якший error-гейт 35%, тихіший зонд, probe-зразок зберігається)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.20 (probe: викинуто рівневий гейт 0.20*maxLv — лишився SNR+error; pre-emphasis тягне слабкі-чисті)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -382,16 +382,18 @@ function applyProbe(rec,sr,silLen){
     for(let c=0;c<CAND.length;c++){let I=0,Q=0;for(let i=0;i<nn;i++){const t=2*Math.PI*CAND[c]*i/sr;I+=rec[off+i]*Math.sin(t);Q+=rec[off+i]*Math.cos(t);}
       const bit=Math.hypot(I,Q)>0.5*lv[c]?1:0; if(bit!==probeBit(s*CAND.length+c)) err[c]++; }}
   const errRate=CAND.map(c=>trDone?err[c]/trDone:1);
-  // ГЕЙТ: SNR≥6 ТА рівень≥20% ТА ПОМИЛКА≤35% (error-гейт викидає лише ЯВНО спотворені — не над-фільтрує).
-  // 12% було надто строго: probe-блек 99 несучих сам клікує на гучному → ловив усі. 35% = тільки биті.
-  const GATE=6, ERRMAX=0.35;
-  const activeIdx=[]; for(let c=0;c<CAND.length;c++){ const snr=lv[c]/Math.max(noise[c],1e-9); if(snr>=GATE && lv[c]>0.20*maxLv && errRate[c]<=ERRMAX) activeIdx.push(c); }
-  const distorted=CAND.filter((f,c)=>lv[c]>0.20*maxLv && lv[c]/Math.max(noise[c],1e-9)>=GATE && errRate[c]>ERRMAX).length;
+  // ГЕЙТ: SNR≥4 ТА ПОМИЛКА≤35%. БЕЗ рівневого гейту 0.20*maxLv — він був killer-ом:
+  // канал гостро-резонансний (1-2кГц = 50%+ енергії), maxLv сідає на пік, чисті несучі в 5× слабші
+  // викидались дарма. Симуляція на реальних зразках: 0.20*maxLv різав 93/99 на тихому каналі
+  // (= телеметрія active=6/99, maxLv=1). Метрика = SNR/помилка, не рівень. Слабкі-чисті тягне pre-emphasis (GTX).
+  const GATE=4, ERRMAX=0.35;
+  const activeIdx=[]; for(let c=0;c<CAND.length;c++){ const snr=lv[c]/Math.max(noise[c],1e-9); if(snr>=GATE && errRate[c]<=ERRMAX) activeIdx.push(c); }
+  const distorted=CAND.filter((f,c)=>lv[c]/Math.max(noise[c],1e-9)>=GATE && errRate[c]>ERRMAX).length;
   renderProbe(lv,noise,new Set(activeIdx));
   if(bv<20) document.getElementById('probeinfo').textContent=`⚠ слабкий синк зонда (${bv.toFixed(0)}) — вимір ненадійний, гучніше. `;
-  if(activeIdx.length<4){
-    document.getElementById('probeinfo').textContent+=`лише ${activeIdx.length} надійних несучих (${distorted} сильних але спотворених викинуто error-гейтом). Спробуй ТИХІШЕ/гучніше.`;
-    stat('ПРОБ: мало надійних несучих','err'); return;
+  if(activeIdx.length<3){
+    document.getElementById('probeinfo').textContent+=`канал майже глухий: ${activeIdx.length} несучих із SNR≥${GATE} (${distorted} спотворених). Зонд не почув достатньо — ближче мік до динаміка.`;
+    stat('ПРОБ: канал майже глухий','err'); return;
   }
   const amax=Math.max(...activeIdx.map(c=>lv[c]));
   FREQS=activeIdx.map(c=>CAND[c]);
