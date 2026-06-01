@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.18 (probe error-гейт: викидає спотворені-але-сильні несучі)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.19 (probe фікс: м'якший error-гейт 35%, тихіший зонд, probe-зразок зберігається)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -316,7 +316,8 @@ function buildProbe(sr){
   // тренування: NTR символів відомого патерну -> RX міряє ПОМИЛКУ кожної несучої (ловить спотворені-але-сильні)
   for(let s=0;s<NTR;s++){const off=preN+nn+s*nn;
     for(let i=0;i<nn;i++){let w=0;for(let c=0;c<CAND.length;c++){if(probeBit(s*CAND.length+c))w+=Math.sin(2*Math.PI*CAND[c]*i/sr);} out[off+i]+=(w/CAND.length)*env[i];}}
-  let pk=0;for(let i=0;i<total;i++)pk=Math.max(pk,Math.abs(out[i]));if(pk>0){const g=0.9/pk;for(let i=0;i<total;i++)out[i]*=g;}
+  // 0.65 (не 0.9): 99 несучих разом = високий crest factor; нижчий пік щоб динамік НЕ клікав під час зонда
+  let pk=0;for(let i=0;i<total;i++)pk=Math.max(pk,Math.abs(out[i]));if(pk>0){const g=0.65/pk;for(let i=0;i<total;i++)out[i]*=g;}
   return out;
 }
 function renderProbe(lv,noise,activeSet){
@@ -355,6 +356,7 @@ async function probe(){
   await new Promise(r=>setTimeout(r,(pcm.length/psr+0.4)*1000));
   node.disconnect(); stream.getTracks().forEach(t=>t.stop());
   let len=0; for(const c of buf) len+=c.length; const rec=new Float32Array(len); let o=0; for(const c of buf){rec.set(c,o);o+=c.length;}
+  lastRec={pcm:rec,sr};   // probe-запис теж зберігаємо -> можна здати зразок probe для офлайн-тесту
   applyProbe(rec,sr,silLen);
 }
 function applyProbe(rec,sr,silLen){
@@ -380,8 +382,9 @@ function applyProbe(rec,sr,silLen){
     for(let c=0;c<CAND.length;c++){let I=0,Q=0;for(let i=0;i<nn;i++){const t=2*Math.PI*CAND[c]*i/sr;I+=rec[off+i]*Math.sin(t);Q+=rec[off+i]*Math.cos(t);}
       const bit=Math.hypot(I,Q)>0.5*lv[c]?1:0; if(bit!==probeBit(s*CAND.length+c)) err[c]++; }}
   const errRate=CAND.map(c=>trDone?err[c]/trDone:1);
-  // ГЕЙТ: SNR≥6 ТА рівень≥20% ТА ПОМИЛКА≤12% (error-гейт викидає спотворені)
-  const GATE=6, ERRMAX=0.12;
+  // ГЕЙТ: SNR≥6 ТА рівень≥20% ТА ПОМИЛКА≤35% (error-гейт викидає лише ЯВНО спотворені — не над-фільтрує).
+  // 12% було надто строго: probe-блек 99 несучих сам клікує на гучному → ловив усі. 35% = тільки биті.
+  const GATE=6, ERRMAX=0.35;
   const activeIdx=[]; for(let c=0;c<CAND.length;c++){ const snr=lv[c]/Math.max(noise[c],1e-9); if(snr>=GATE && lv[c]>0.20*maxLv && errRate[c]<=ERRMAX) activeIdx.push(c); }
   const distorted=CAND.filter((f,c)=>lv[c]>0.20*maxLv && lv[c]/Math.max(noise[c],1e-9)>=GATE && errRate[c]>ERRMAX).length;
   renderProbe(lv,noise,new Set(activeIdx));
