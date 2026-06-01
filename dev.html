@@ -70,7 +70,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.7 (RS+блоки+накопичення, 20 несучих)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.8 (телеметрія: кнопки+аудіосигнатура)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -88,7 +88,7 @@ function rsSynd(msg,nsym){const s=new Uint8Array(nsym);for(let i=0;i<nsym;i++)s[
 function rsLoc(synd){let el=[1],ol=[1];for(let i=0;i<synd.length;i++){let d=synd[i];for(let j=1;j<el.length;j++)d^=gfMul(el[el.length-1-j],synd[i-j]);ol=ol.concat([0]);if(d!==0){if(ol.length>el.length){const nl=pScale(ol,d);ol=pScale(el,gfInv(d));el=nl;}el=pAdd(el,pScale(ol,d));}}while(el.length&&el[0]===0)el.shift();return el;}
 function rsPos(el,nmess){const errs=el.length-1,pos=[];for(let i=0;i<255;i++){if(pEval(el,gfPow(2,i))===0){const cp=(255-i)%255,bi=(nmess-1)-cp;if(bi>=0&&bi<nmess)pos.push(bi);}}return pos.length===errs?pos:null;}
 function rsCorr(msg,synd,errPos){const cp=errPos.map(p=>msg.length-1-p);let el=[1];for(const p of cp)el=pMul(el,pAdd([1],[gfPow(2,p),0]));const sr=Array.from(synd).reverse();let ev=pMul(sr,el);ev=ev.slice(ev.length-el.length);const X=cp.map(p=>gfPow(2,p)),out=Uint8Array.from(msg);for(let i=0;i<X.length;i++){const xi=gfInv(X[i]);let den=1;for(let j=0;j<X.length;j++)if(j!==i)den=gfMul(den,1^gfMul(xi,X[j]));if(den===0)return null;out[errPos[i]]^=gfDiv(pEval(ev,xi),den);}return out;}
-function rsDecode(block,nsym){const msg=Uint8Array.from(block),synd=rsSynd(msg,nsym);let z=true;for(const s of synd)if(s!==0){z=false;break;}if(z)return{ok:true,msg:msg.slice(0,block.length-nsym)};const el=rsLoc(synd),pos=rsPos(el,msg.length);if(!pos||pos.length>nsym/2)return{ok:false,msg:null};const c=rsCorr(msg,synd,pos);if(!c)return{ok:false,msg:null};const s2=rsSynd(c,nsym);for(const s of s2)if(s!==0)return{ok:false,msg:null};return{ok:true,msg:c.slice(0,block.length-nsym)};}
+function rsDecode(block,nsym){const msg=Uint8Array.from(block),synd=rsSynd(msg,nsym);let z=true;for(const s of synd)if(s!==0){z=false;break;}if(z)return{ok:true,msg:msg.slice(0,block.length-nsym),nerr:0};const el=rsLoc(synd),pos=rsPos(el,msg.length);if(!pos||pos.length>nsym/2)return{ok:false,msg:null,nerr:-1};const c=rsCorr(msg,synd,pos);if(!c)return{ok:false,msg:null,nerr:-1};const s2=rsSynd(c,nsym);for(const s of s2)if(s!==0)return{ok:false,msg:null,nerr:-1};return{ok:true,msg:c.slice(0,block.length-nsym),nerr:pos.length};}
 
 /* ============================ КОНФІГ ============================ */
 const PRE_F0=1200, PRE_F1=3800, PRE_DUR=0.20;            // чирп-маячок: гострий пік кореляції
@@ -110,7 +110,8 @@ const setProg=s=>document.getElementById('prog').textContent=s;
 
 /* ---- авто-телеметрія (тільки цифри) -> ntfy, Hanz обрав топік ---- */
 const TELE="hanz-soundmodem-x7k92q";
-function tele(t,b){if(!TELE)return;try{fetch('https://ntfy.sh/'+TELE,{method:'POST',headers:{'Title':t,'Tags':'sound'},body:String(b).slice(0,400)});}catch(e){}}
+function tele(t,b){if(!TELE)return;try{fetch('https://ntfy.sh/'+TELE,{method:'POST',headers:{'Title':t,'Tags':'sound'},body:String(b).slice(0,1200)});}catch(e){}}
+function btn(name){tele('BTN',`${name} | ${MODE}`);}   // які кнопки натиснуті — видно коли зупинили
 
 /* ============================ біти/crc ============================ */
 function bytesToBits(b){const o=[];for(const by of b)for(let i=0;i<8;i++)o.push((by>>i)&1);return o;}
@@ -195,11 +196,27 @@ function findPeaks(rec,sr){
     // уточнити ±2 семпли
     let best=p,bv=score[si];
     for(let q=Math.max(0,p-2);q<=p+2;q++){let s=0;for(let i=0;i<preN;i++)s+=rec[q+i]*ch[i];const e=ps[q+preN]-ps[q];const sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0;if(sc>bv){bv=sc;best=q;}}
-    peaks.push(best);
+    peaks.push({p:best, sc:bv});
     for(let j=Math.max(0,si-minGap);j<Math.min(score.length,si+minGap);j++)used[j]=1;
   }
-  peaks.sort((a,b)=>a-b);
+  peaks.sort((a,b)=>a.p-b.p);
   return peaks;
+}
+
+// ---- аудіосигнатура: коарс лог-спектр що почув мік + рівні по несучих ----
+function specSig(rec,sr){
+  const fb=[]; for(let i=0;i<24;i++) fb.push(200*Math.pow(8000/200,i/23));
+  const start=Math.floor(rec.length*0.25), L=Math.min(rec.length-start, Math.round(sr*0.3));
+  if(L<=0) return '------------------------';
+  const mags=fb.map(f=>{let I=0,Q=0;for(let nn=0;nn<L;nn++){const t=2*Math.PI*f*nn/sr;I+=rec[start+nn]*Math.cos(t);Q+=rec[start+nn]*Math.sin(t);}return Math.hypot(I,Q)/L;});
+  const mx=Math.max(...mags,1e-12);
+  return mags.map(m=>Math.min(9,Math.round(9*m/mx))).join('');
+}
+function carrierSig(rec,sr,p){
+  const n=Math.round(sr*cfg().BIT), calibAt=p+Math.round(sr*PRE_DUR);
+  const lv=FREQS.map(f=>{let I=0,Q=0;for(let i=0;i<n;i++){const t=2*Math.PI*f*i/sr;I+=rec[calibAt+i]*Math.sin(t);Q+=rec[calibAt+i]*Math.cos(t);}return Math.hypot(I,Q);});
+  const mx=Math.max(...lv,1e-12);
+  return lv.map(x=>Math.min(9,Math.round(9*x/mx))).join('');
 }
 
 /* ============================ накопичення (ARQ через повтори) ============================ */
@@ -232,7 +249,7 @@ function tryAssemble(){
 }
 
 /* ============================ UI: режим ============================ */
-function setMode(m){MODE=m;document.getElementById('mFast').classList.toggle('on',m==='fast');document.getElementById('mSafe').classList.toggle('on',m==='safe');resetRecv();}
+function setMode(m){MODE=m;document.getElementById('mFast').classList.toggle('on',m==='fast');document.getElementById('mSafe').classList.toggle('on',m==='safe');resetRecv();btn('режим='+m);}
 document.getElementById('mFast').onclick=()=>setMode('fast');
 document.getElementById('mSafe').onclick=()=>setMode('safe');
 
@@ -244,7 +261,8 @@ async function getCtx(){if(!actx)actx=new(window.AudioContext||window.webkitAudi
 let txSource=null;
 function stopTx(){ if(txSource){try{txSource.stop();}catch(e){} txSource=null;} document.getElementById('send').textContent='▶ ГРАТИ ЗВУК'; }
 document.getElementById('send').onclick=async()=>{
-  if(txSource){ stopTx(); stat('зупинено.'); return; }   // друге натискання = стоп
+  if(txSource){ btn('ГРАТИ→ЗУПИНИТИ'); stopTx(); stat('зупинено.'); return; }   // друге натискання = стоп
+  btn('ГРАТИ');
   try{
     const ctx=await getCtx(), sr=ctx.sampleRate;
     let bytes;
@@ -266,6 +284,7 @@ document.getElementById('send').onclick=async()=>{
 /* ============================ RX ============================ */
 let rxBuf=[], rxSR=44100, recStream=null, recNode=null, recCtx=null;
 document.getElementById('listen').onclick=async()=>{
+  btn('СЛУХАТИ');
   try{
     recStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
     recCtx=new(window.AudioContext||window.webkitAudioContext)();rxSR=recCtx.sampleRate;rxBuf=[];
@@ -277,8 +296,9 @@ document.getElementById('listen').onclick=async()=>{
     stat('слухаю… натисни СТОП коли передача завершиться.');
   }catch(e){stat('мік недоступний: '+e.message,'err');}
 };
-document.getElementById('reset').onclick=()=>{resetRecv();stat('накопичення скинуто.');};
+document.getElementById('reset').onclick=()=>{btn('СКИНУТИ');resetRecv();stat('накопичення скинуто.');};
 document.getElementById('stop').onclick=async()=>{
+  btn('СТОП+ДЕКОД');
   try{
     if(recNode)recNode.disconnect();if(recStream)recStream.getTracks().forEach(t=>t.stop());
     document.getElementById('listen').disabled=false;document.getElementById('stop').disabled=true;document.getElementById('vu').value=0;
@@ -290,18 +310,27 @@ document.getElementById('stop').onclick=async()=>{
 
 function processRec(rec,sr){
   const peaks=findPeaks(rec,sr);
-  let newOk=0, seen=0;
-  for(const p of peaks){const dec=decodeBlockAt(rec,sr,p);seen++;if(ingestBlock(dec))newOk++;}
+  let newOk=0, seen=0, errs=[], fails=0;
+  for(const {p,sc} of peaks){const dec=decodeBlockAt(rec,sr,p);seen++;if(dec&&dec.ok)errs.push(dec.nerr);else fails++;if(ingestBlock(dec))newOk++;}
   renderBlocks();
   const have=recv.map.size, tot=recv.total;
+  const dur=(rec.length/sr).toFixed(1);
+  let peak=0; for(let i=0;i<rec.length;i++){const a=Math.abs(rec[i]);if(a>peak)peak=a;}
+  const syncTop=peaks.slice().sort((a,b)=>b.sc-a.sc).slice(0,3).map(x=>x.sc.toFixed(2)).join(',');
+  const avgErr=errs.length?(errs.reduce((a,b)=>a+b,0)/errs.length).toFixed(1):'-';
+  const cSig=peaks.length?carrierSig(rec,sr,peaks[0].p):'-';
+  const sSig=specSig(rec,sr);
+  // АУДІОСИГНАТУРА: дає ПОВНУ картину каналу навіть коли 0 блоків
+  const sig=`${VERSION}|${cfg().name} sr=${sr} dur=${dur}s pk=${peak.toFixed(3)} chirps=${peaks.length} sync=[${syncTop}] blk=${have}/${tot||'?'} +${newOk} fail=${fails} rsErr~${avgErr} | carr=${cSig} | spec=${sSig}`;
   const asm=tryAssemble();
   if(asm&&!asm.bad){
     finish(asm);
+    tele('RX-OK',sig);
   }else{
     const miss=tot?(tot-have):'?';
-    setProg(`блоків: ${have}/${tot||'?'} (цей прохід +${newOk} з ${seen} знайдених чирпів)`);
-    stat(tot?`не всі: лишилось ${miss}. ГРАЙ ЩЕ РАЗ той самий файл — блоки накопичаться.`:'жодного блока не зловлено — ближче/гучніше, або довша передача.','err');
-    tele('RX-part',`have=${have}/${tot} +${newOk}/${seen} ${cfg().name} sr=${sr}`);
+    setProg(`блоків: ${have}/${tot||'?'} (+${newOk} з ${peaks.length} чирпів, ${fails} не декод.)`);
+    stat(tot?`не всі: лишилось ${miss}. ГРАЙ ЩЕ РАЗ той самий файл — блоки накопичаться.`:'жодного блока не зловлено — дивись сигнатуру/гучніше/ближче.','err');
+    tele('RX-part',sig);
   }
 }
 function finish(asm){
@@ -321,6 +350,7 @@ function finish(asm){
 
 /* ============================ САМОТЕСТ (без мікрофона): синтез->шум->декод ============================ */
 document.getElementById('selftest').onclick=()=>{
+  btn('САМОТЕСТ');
   const sr=44100;
   resetRecv();
   const data=new Uint8Array(600); for(let i=0;i<data.length;i++)data[i]=(i*131+7)&255;
@@ -331,7 +361,7 @@ document.getElementById('selftest').onclick=()=>{
   let seed=12345; const rnd=()=>{seed=(seed*1103515245+12345)&0x7fffffff;return seed/0x7fffffff-0.5;};
   for(let i=0;i<pcm.length;i++)noisy[i]=pcm[i]+0.015*rnd();
   const peaks=findPeaks(noisy,sr);
-  let ok=0;for(const p of peaks){if(ingestBlock(decodeBlockAt(noisy,sr,p)))ok++;}
+  let ok=0;for(const {p} of peaks){if(ingestBlock(decodeBlockAt(noisy,sr,p)))ok++;}
   const asm=tryAssemble();
   renderBlocks();
   const pass=asm&&!asm.bad&&asm.len===data.length&&[...asm.file].every((b,i)=>b===data[i]);
