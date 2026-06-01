@@ -24,11 +24,15 @@
   .lbl { color:#888; font-size:12px; margin:14px 0 4px; }
   .stat { color:#9ca3af; font-size:12px; margin-top:8px; min-height:16px; }
   .ok { color:#22c55e; } .err { color:#ef4444; }
-  meter { width:100%; height:10px; }
+  meter { width:100%; height:14px; }
   .prog { font-size:13px; color:#cbd5e1; margin-top:6px; }
-  .blocks { display:flex; flex-wrap:wrap; gap:3px; margin-top:6px; }
-  .blk { width:12px; height:12px; border-radius:2px; background:#374151; }
+  .blocks { display:flex; flex-wrap:wrap; gap:4px; margin-top:6px; }
+  .blk { width:18px; height:18px; border-radius:3px; background:#374151; }
   .blk.got { background:#22c55e; }
+  .carriers { display:flex; gap:2px; align-items:flex-end; height:60px; margin-top:6px; }
+  .carcol { flex:1; display:flex; flex-direction:column; justify-content:flex-end; align-items:center; }
+  .carbar { width:100%; border-radius:2px 2px 0 0; min-height:2px; }
+  .carlbl { font-size:8px; color:#777; margin-top:2px; }
   a.dl { color:#60a5fa; }
 </style>
 </head>
@@ -60,10 +64,15 @@
     <button id="stop" class="rec" disabled>■ СТОП + ДЕКОД</button>
     <button id="reset" class="alt">↺ СКИНУТИ</button>
   </div>
+  <div class="lbl">РІВЕНЬ МІКРОФОНА (під час прийому)</div>
   <meter id="vu" min="0" max="0.3" value="0"></meter>
-  <div class="prog" id="counts"></div>
+  <div class="lbl">ПРОГРЕС ПРИЙОМУ</div>
+  <div class="prog" id="counts">—</div>
   <div class="prog" id="prog"></div>
+  <div class="lbl">БЛОКИ (🟩 зловлено / ⬜ чекаємо)</div>
   <div class="blocks" id="blocks"></div>
+  <div class="lbl">КАНАЛ — рівень несучих, кГц (🟩 чисто / 🟨 слабко / 🟥 глухо)</div>
+  <div class="carriers" id="carriers"></div>
   <div class="lbl">ОТРИМАНО</div>
   <div class="out" id="out"></div>
   <div class="stat" id="stat">готовий. дай дозвіл на мікрофон коли спитає.</div>
@@ -74,7 +83,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.9 (прогрес-бар, живі блоки, фікс файл/текст, без зависань)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.10 (видимий спектр несучих, підписані індикатори)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -224,11 +233,24 @@ function specSig(rec,sr){
   const mx=Math.max(...mags,1e-12);
   return mags.map(m=>Math.min(9,Math.round(9*m/mx))).join('');
 }
-function carrierSig(rec,sr,p){
+function carrierLevels(rec,sr,p){
   const n=Math.round(sr*cfg().BIT), calibAt=p+Math.round(sr*PRE_DUR);
-  const lv=FREQS.map(f=>{let I=0,Q=0;for(let i=0;i<n;i++){const t=2*Math.PI*f*i/sr;I+=rec[calibAt+i]*Math.sin(t);Q+=rec[calibAt+i]*Math.cos(t);}return Math.hypot(I,Q);});
-  const mx=Math.max(...lv,1e-12);
+  return FREQS.map(f=>{let I=0,Q=0;for(let i=0;i<n;i++){const t=2*Math.PI*f*i/sr;I+=rec[calibAt+i]*Math.sin(t);Q+=rec[calibAt+i]*Math.cos(t);}return Math.hypot(I,Q);});
+}
+function carrierSig(rec,sr,p){
+  const lv=carrierLevels(rec,sr,p), mx=Math.max(...lv,1e-12);
   return lv.map(x=>Math.min(9,Math.round(9*x/mx))).join('');
+}
+function renderCarriers(rec,sr,p){
+  const el=document.getElementById('carriers'); el.innerHTML='';
+  const lv=carrierLevels(rec,sr,p), mx=Math.max(...lv,1e-12);
+  FREQS.forEach((f,i)=>{
+    const frac=lv[i]/mx, h=Math.max(2,Math.round(50*frac));
+    const col=frac>0.5?'#22c55e':frac>0.2?'#eab308':'#ef4444';
+    const c=document.createElement('div'); c.className='carcol';
+    c.innerHTML=`<div class="carbar" style="height:${h}px;background:${col}"></div><div class="carlbl">${(f/1000).toFixed(1)}</div>`;
+    el.appendChild(c);
+  });
 }
 
 /* ============================ накопичення (ARQ через повтори) ============================ */
@@ -341,6 +363,7 @@ function updCounts(newOk,fails,tot,done){
 async function processRec(rec,sr){
   setProg('шукаю чирпи…'); await tick();
   const peaks=findPeaks(rec,sr);
+  if(peaks.length) renderCarriers(rec,sr,peaks[0].p);    // видимий спектр несучих — які живі/глухі
   setProg(`знайдено ${peaks.length} чирпів, декодую…`); await tick();
   let newOk=0, errs=[], fails=0;
   for(let bi=0;bi<peaks.length;bi++){
