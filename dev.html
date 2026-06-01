@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.23 (здача зразка несе meta.json з точними FREQS/NCAR -> офлайн відтворення декоду; BTN-спам вимкнено щоб не палити квоту ntfy)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.24 (фальш-чирп фільтр: ліві піки score~1.5 збивали вирівнювання -> пів передачі сміття; probe error-гейт 35%->12% щоб відсіяти маргінальні несучі що топлять RS)"; BTN-спам вимкнено щоб не палити квоту ntfy)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -267,6 +267,15 @@ function findPeaks(rec,sr){
     for(let j=Math.max(0,si-minGap);j<Math.min(score.length,si+minGap);j++)used[j]=1;
   }
   peaks.sort((a,b)=>a.p-b.p);
+  // ФАЛЬШ-ЧИРП ФІЛЬТР: справжні чирпи дають score ~48, ліві піки (дані корелюють зі свіпом) ~1.5.
+  // Абсолютний поріг 0.45 їх пускав -> зсував вирівнювання блоків -> пів передачі сміття. Ріжемо
+  // відносно медіани сильних піків: лишаємо лише score >= 0.3*медіана. (доведено на реальному записі)
+  if(peaks.length>=3){
+    const ss=peaks.map(p=>p.sc).slice().sort((a,b)=>a-b), med=ss[ss.length>>1];
+    const cut=0.3*med;
+    const kept=peaks.filter(p=>p.sc>=cut);
+    if(kept.length>=2) return kept;
+  }
   return peaks;
 }
 
@@ -386,7 +395,9 @@ function applyProbe(rec,sr,silLen){
   // канал гостро-резонансний (1-2кГц = 50%+ енергії), maxLv сідає на пік, чисті несучі в 5× слабші
   // викидались дарма. Симуляція на реальних зразках: 0.20*maxLv різав 93/99 на тихому каналі
   // (= телеметрія active=6/99, maxLv=1). Метрика = SNR/помилка, не рівень. Слабкі-чисті тягне pre-emphasis (GTX).
-  const GATE=4, ERRMAX=0.35;
+  const GATE=4, ERRMAX=0.12;   // 35%->12%: byte-RS тоне якщо >~1.3% біт-BER. Маргінальні несучі (data-BER 8-50%)
+                               // дають elevated training-error -> тісніший гейт відсіює їх ДО того як TX на них сяде.
+                               // Доведено на реальному записі: 20/92 несучих псували RS; треба ~72 чистих.
   const activeIdx=[]; for(let c=0;c<CAND.length;c++){ const snr=lv[c]/Math.max(noise[c],1e-9); if(snr>=GATE && errRate[c]<=ERRMAX) activeIdx.push(c); }
   const distorted=CAND.filter((f,c)=>lv[c]/Math.max(noise[c],1e-9)>=GATE && errRate[c]>ERRMAX).length;
   renderProbe(lv,noise,new Set(activeIdx));
