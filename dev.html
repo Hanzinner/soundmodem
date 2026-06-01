@@ -45,6 +45,13 @@
     <button id="mFast" class="tog">⚡ ШВИДКО</button>
     <button id="mSafe" class="tog on">🛡 НАДІЙНО</button>
   </div>
+  <div class="lbl">АДАПТАЦІЯ ДО КАНАЛУ (probe міряє → бере живі несучі по всьому спектру)</div>
+  <div class="row">
+    <button id="probe" class="tog">🎯 ПРОБ КАНАЛУ</button>
+    <button id="unlock" class="tog">🔓 вищі частоти</button>
+  </div>
+  <div class="carriers" id="probeview"></div>
+  <div class="stat" id="probeinfo"></div>
 
   <div class="lbl">ПЕРЕДАТИ — текст або файл</div>
   <textarea id="msg" placeholder="напиши повідомлення…">hanz beer</textarea>
@@ -83,7 +90,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.10 (видимий спектр несучих, підписані індикатори)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.11 (PROBE-раунд: адаптація до каналу, повний спектр до 20-23к)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -107,8 +114,16 @@ function rsDecode(block,nsym){const msg=Uint8Array.from(block),synd=rsSynd(msg,n
 const PRE_F0=1200, PRE_F1=3800, PRE_DUR=0.20;            // чирп-маячок: гострий пік кореляції
 const FADE=0.12;
 // ширша смуга = більше несучих = швидше. 700-4500 (300-8к телефони тримають близько). 20 несучих vs 14.
-const FREQS=[]; for(let f=700;f<=4500;f+=200) FREQS.push(f);
-const NCAR=FREQS.length;
+// АКТИВНІ несучі (probe переписує). Default = валідований плоский набір. GTX = pre-emphasis на несучу.
+let FREQS=[]; for(let f=700;f<=4500;f+=200) FREQS.push(f);
+let NCAR=FREQS.length;
+let GTX=FREQS.map(()=>1);
+// КАНДИДАТИ повної смуги для probe. Кидаємо ШИРОКО (до 20к, розблок до 23к) — probe сам відсіє мертві.
+// Стеля Найквіста: sr/2 (24к на 48k, 22к на 44.1k). UNLOCK тисне до краю.
+let CAND_HI=20000;
+function buildCand(){ const a=[]; for(let f=300;f<=CAND_HI;f+=200) a.push(f); return a; }
+let CAND=buildCand();
+let PROBED=false;
 const GAP=0.12;                                          // тиша між блоками (було 0.25 — зрізав оверхед)
 // режими: parity (RS) + такт BIT. НАДІЙНО за замовч (2 пристрої брудні), але швидше ніж було.
 const MODES={ fast:{BIT:0.032, parity:24, name:"швидко"}, safe:{BIT:0.045, parity:48, name:"надійно"} };
@@ -160,7 +175,7 @@ function buildSignal(blocks,sr){
   const buf=new Float32Array(total);
   const env=new Float32Array(n).fill(1); for(let i=0;i<fade;i++){env[i]=i/fade;env[n-1-i]=i/fade;}
   const ch=chirp(sr);
-  const addSym=(off,mask)=>{for(let i=0;i<n;i++){let w=0;for(let c=0;c<NCAR;c++)if(mask[c])w+=Math.sin(2*Math.PI*FREQS[c]*i/sr);buf[off+i]+=(w/NCAR)*env[i];}};
+  const addSym=(off,mask)=>{for(let i=0;i<n;i++){let w=0;for(let c=0;c<NCAR;c++)if(mask[c])w+=GTX[c]*Math.sin(2*Math.PI*FREQS[c]*i/sr);buf[off+i]+=(w/NCAR)*env[i];}};
   const allOn=new Array(NCAR).fill(1);
   let off=0;
   for(const blk of blocks){
@@ -252,6 +267,89 @@ function renderCarriers(rec,sr,p){
     el.appendChild(c);
   });
 }
+
+/* ============================ PROBE-РАУНД (self-loopback): міряє канал -> бере живі несучі ============================ */
+const median=a=>{const b=[...a].sort((x,y)=>x-y);return b.length?b[b.length>>1]:0;};
+function buildProbe(sr){
+  const nn=Math.round(sr*cfg().BIT), preN=Math.round(sr*PRE_DUR), fade=Math.max(4,Math.round(FADE*nn));
+  const total=preN+nn+Math.round(sr*0.4);
+  const out=new Float32Array(total);
+  const ch=chirp(sr); for(let i=0;i<preN;i++) out[i]+=0.6*ch[i];
+  const env=new Float32Array(nn).fill(1); for(let i=0;i<fade;i++){env[i]=i/fade;env[nn-1-i]=i/fade;}
+  for(let i=0;i<nn;i++){let w=0;for(const f of CAND)w+=Math.sin(2*Math.PI*f*i/sr);out[preN+i]+=(w/CAND.length)*env[i];}
+  let pk=0;for(let i=0;i<total;i++)pk=Math.max(pk,Math.abs(out[i]));if(pk>0){const g=0.9/pk;for(let i=0;i<total;i++)out[i]*=g;}
+  return out;
+}
+function renderProbe(lv,noise,activeSet){
+  const el=document.getElementById('probeview'); el.innerHTML='';
+  const mx=Math.max(...lv,1e-12);
+  CAND.forEach((f,c)=>{
+    const frac=lv[c]/mx, h=Math.max(2,Math.round(54*frac));
+    const col=activeSet.has(c)?'#22c55e':(frac>0.15?'#eab308':'#ef4444');
+    const d=document.createElement('div'); d.className='carcol';
+    const lbl=(c%5===0)?(f/1000).toFixed(0):'';
+    d.innerHTML=`<div class="carbar" style="height:${h}px;background:${col}"></div><div class="carlbl">${lbl}</div>`;
+    el.appendChild(d);
+  });
+}
+async function probe(){
+  btn('ПРОБ');
+  let stream;
+  try{ stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}}); }
+  catch(e){ stat('мік недоступний: '+e.message,'err'); return; }
+  const rc=new (window.AudioContext||window.webkitAudioContext)(); const sr=rc.sampleRate;
+  const buf=[]; const src=rc.createMediaStreamSource(stream);
+  const node=rc.createScriptProcessor(4096,1,1);
+  node.onaudioprocess=e=>buf.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(node); node.connect(rc.destination);
+  stat('🎯 ПРОБ: граю зонд по всьому спектру (300–'+CAND_HI/1000+'к)…');
+  await new Promise(r=>setTimeout(r,200));                 // лід-тиша -> шумова підлога
+  const pctx=await getCtx(); const psr=pctx.sampleRate;
+  const pcm=buildProbe(psr);
+  const ab=pctx.createBuffer(1,pcm.length,psr); ab.getChannelData(0).set(pcm);
+  const psrc=pctx.createBufferSource(); psrc.buffer=ab; psrc.connect(pctx.destination); psrc.start();
+  await new Promise(r=>setTimeout(r,(pcm.length/psr+0.4)*1000));
+  node.disconnect(); stream.getTracks().forEach(t=>t.stop());
+  let len=0; for(const c of buf) len+=c.length; const rec=new Float32Array(len); let o=0; for(const c of buf){rec.set(c,o);o+=c.length;}
+  applyProbe(rec,sr);
+}
+function applyProbe(rec,sr){
+  const nn=Math.round(sr*cfg().BIT), preN=Math.round(sr*PRE_DUR);
+  const ch=chirp(sr), ps=new Float64Array(rec.length+1);
+  for(let i=0;i<rec.length;i++)ps[i+1]=ps[i]+rec[i]*rec[i];
+  const lim=rec.length-preN-nn; if(lim<=0){stat('ПРОБ: запис закороткий','err');return;}
+  let best=-1,bv=-1;
+  for(let p=0;p<lim;p+=2){let s=0;for(let i=0;i<preN;i+=2)s+=rec[p+i]*ch[i];const e=ps[p+preN]-ps[p];const sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0;if(sc>bv){bv=sc;best=p;}}
+  if(best<0){stat('ПРОБ: зонд не почуто — гучніше/ближче','err');return;}
+  const calibAt=best+preN, nWin=Math.max(1,Math.min(best,nn));
+  const noise=CAND.map(f=>{let I=0,Q=0;for(let i=0;i<nWin;i++){const t=2*Math.PI*f*i/sr;I+=rec[i]*Math.sin(t);Q+=rec[i]*Math.cos(t);}return Math.hypot(I,Q)/nWin*nn;});
+  const lv=CAND.map(f=>{let I=0,Q=0;for(let i=0;i<nn;i++){const t=2*Math.PI*f*i/sr;I+=rec[calibAt+i]*Math.sin(t);Q+=rec[calibAt+i]*Math.cos(t);}return Math.hypot(I,Q);});
+  const nmed=median(noise), GATE=4;
+  const activeIdx=[]; for(let c=0;c<CAND.length;c++) if(lv[c]>GATE*Math.max(noise[c],nmed)) activeIdx.push(c);
+  const aset=new Set(activeIdx);
+  renderProbe(lv,noise,aset);
+  if(activeIdx.length<4){
+    document.getElementById('probeinfo').textContent=`лише ${activeIdx.length} живих несучих — гучніше/ближче, тоді ПРОБ знову`;
+    stat('ПРОБ: канал надто тихий/вузький','err'); return;
+  }
+  const amax=Math.max(...activeIdx.map(c=>lv[c]));
+  FREQS=activeIdx.map(c=>CAND[c]);
+  GTX=activeIdx.map(c=>Math.min(4,amax/Math.max(lv[c],1e-9)));
+  NCAR=FREQS.length; PROBED=true; resetRecv();
+  document.getElementById('probe').classList.add('on');
+  const band=`${FREQS[0]}–${FREQS[FREQS.length-1]} Гц`;
+  document.getElementById('probeinfo').textContent=`✓ ${NCAR} живих несучих, смуга ${band}. Тепер ГРАТИ — піде адаптивно по всіх живих.`;
+  stat(`✓ ПРОБ: ${NCAR} несучих, ${band}`,'ok');
+  tele('PROBE',`${VERSION}|active=${NCAR}/${CAND.length} band=${band} sr=${sr} sync=${bv.toFixed(1)} hi=${CAND_HI}`);
+}
+document.getElementById('probe').onclick=probe;
+document.getElementById('unlock').onclick=()=>{
+  CAND_HI = CAND_HI>=23000 ? 20000 : 23000;   // тисне до краю Найквіста (на 48k=24к). тумблер 20к<->23к
+  CAND=buildCand();
+  document.getElementById('unlock').classList.toggle('on',CAND_HI>20000);
+  document.getElementById('unlock').textContent = CAND_HI>20000 ? '🔓 до 23к' : '🔓 вищі частоти';
+  stat(`кандидати до ${CAND_HI/1000}к. Натисни ПРОБ щоб перевиміряти.`);
+};
 
 /* ============================ накопичення (ARQ через повтори) ============================ */
 let recv={map:new Map(), total:0, crc:0, len:0};
