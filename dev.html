@@ -29,10 +29,10 @@
   .blocks { display:flex; flex-wrap:wrap; gap:4px; margin-top:6px; }
   .blk { width:18px; height:18px; border-radius:3px; background:#374151; }
   .blk.got { background:#22c55e; }
-  .carriers { display:flex; gap:2px; align-items:flex-end; height:60px; margin-top:6px; }
-  .carcol { flex:1; display:flex; flex-direction:column; justify-content:flex-end; align-items:center; }
-  .carbar { width:100%; border-radius:2px 2px 0 0; min-height:2px; }
-  .carlbl { font-size:8px; color:#777; margin-top:2px; }
+  .carriers { display:flex; gap:1px; align-items:flex-end; height:60px; margin-top:6px; overflow:hidden; }
+  .carcol { flex:1 1 0; min-width:0; display:flex; flex-direction:column; justify-content:flex-end; align-items:center; }
+  .carbar { width:100%; border-radius:1px 1px 0 0; min-height:2px; }
+  .carlbl { font-size:8px; color:#777; margin-top:2px; white-space:nowrap; overflow:visible; }
   a.dl { color:#60a5fa; }
 </style>
 </head>
@@ -90,7 +90,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.12 (PROBE фікс: окремий замір шуму + строгий SNR-гейт)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.13 (фікс: спектр стискається під екран; SNR-гейт)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -259,11 +259,13 @@ function carrierSig(rec,sr,p){
 function renderCarriers(rec,sr,p){
   const el=document.getElementById('carriers'); el.innerHTML='';
   const lv=carrierLevels(rec,sr,p), mx=Math.max(...lv,1e-12);
+  const step=Math.max(1,Math.ceil(FREQS.length/8));
   FREQS.forEach((f,i)=>{
     const frac=lv[i]/mx, h=Math.max(2,Math.round(50*frac));
     const col=frac>0.5?'#22c55e':frac>0.2?'#eab308':'#ef4444';
     const c=document.createElement('div'); c.className='carcol';
-    c.innerHTML=`<div class="carbar" style="height:${h}px;background:${col}"></div><div class="carlbl">${(f/1000).toFixed(1)}</div>`;
+    const lbl=(i%step===0)?(f/1000).toFixed(1)+'к':'';
+    c.innerHTML=`<div class="carbar" style="height:${h}px;background:${col}"></div><div class="carlbl">${lbl}</div>`;
     el.appendChild(c);
   });
 }
@@ -283,11 +285,12 @@ function buildProbe(sr){
 function renderProbe(lv,noise,activeSet){
   const el=document.getElementById('probeview'); el.innerHTML='';
   const mx=Math.max(...lv,1e-12);
+  const step=Math.max(1,Math.ceil(CAND.length/8));
   CAND.forEach((f,c)=>{
     const frac=lv[c]/mx, h=Math.max(2,Math.round(54*frac));
     const col=activeSet.has(c)?'#22c55e':(frac>0.15?'#eab308':'#ef4444');
     const d=document.createElement('div'); d.className='carcol';
-    const lbl=(c%5===0)?(f/1000).toFixed(0):'';
+    const lbl=(c%step===0)?(f/1000).toFixed(1)+'к':'';
     d.innerHTML=`<div class="carbar" style="height:${h}px;background:${col}"></div><div class="carlbl">${lbl}</div>`;
     el.appendChild(d);
   });
