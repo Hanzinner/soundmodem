@@ -92,11 +92,12 @@ function rsDecode(block,nsym){const msg=Uint8Array.from(block),synd=rsSynd(msg,n
 /* ============================ КОНФІГ ============================ */
 const PRE_F0=1200, PRE_F1=3800, PRE_DUR=0.20;            // чирп-маячок: гострий пік кореляції
 const FADE=0.12;
-const FREQS=[]; for(let f=1000;f<=3600;f+=200) FREQS.push(f);  // 14 несучих, безпечна телефонна смуга
+// ширша смуга = більше несучих = швидше. 700-4500 (300-8к телефони тримають близько). 20 несучих vs 14.
+const FREQS=[]; for(let f=700;f<=4500;f+=200) FREQS.push(f);
 const NCAR=FREQS.length;
-const GAP=0.25;                                          // тиша між блоками/в кінці
-// режими: parity (RS) + такт BIT. НАДІЙНО за замовч (2 пристрої брудні).
-const MODES={ fast:{BIT:0.035, parity:32, name:"швидко"}, safe:{BIT:0.050, parity:64, name:"надійно"} };
+const GAP=0.12;                                          // тиша між блоками (було 0.25 — зрізав оверхед)
+// режими: parity (RS) + такт BIT. НАДІЙНО за замовч (2 пристрої брудні), але швидше ніж було.
+const MODES={ fast:{BIT:0.032, parity:24, name:"швидко"}, safe:{BIT:0.045, parity:48, name:"надійно"} };
 let MODE="safe";
 const cfg=()=>MODES[MODE];
 const K=()=>255-cfg().parity;            // дата-байтів на RS-блок
@@ -239,7 +240,10 @@ let txFile=null;
 document.getElementById('file').onchange=async e=>{const f=e.target.files[0];if(!f){txFile=null;return;}txFile=new Uint8Array(await f.arrayBuffer());txFile._name=f.name;stat(`файл: ${f.name} ${txFile.length}B`);};
 let actx=null;
 async function getCtx(){if(!actx)actx=new(window.AudioContext||window.webkitAudioContext)();if(actx.state==='suspended')await actx.resume();return actx;}
+let txSource=null;
+function stopTx(){ if(txSource){try{txSource.stop();}catch(e){} txSource=null;} document.getElementById('send').textContent='▶ ГРАТИ ЗВУК'; }
 document.getElementById('send').onclick=async()=>{
+  if(txSource){ stopTx(); stat('зупинено.'); return; }   // друге натискання = стоп
   try{
     const ctx=await getCtx(), sr=ctx.sampleRate;
     let bytes;
@@ -247,12 +251,15 @@ document.getElementById('send').onclick=async()=>{
     else{bytes=new TextEncoder().encode(document.getElementById('msg').value);}
     const {blocks,nblk}=makeBlocks(bytes);
     const pcm=buildSignal(blocks,sr);
+    const durS=pcm.length/sr;
+    const netBps=bytes.length/durS, netbps=netBps*8;        // корисна швидкість (файл/час)
     const ab=ctx.createBuffer(1,pcm.length,sr);ab.getChannelData(0).set(pcm);
-    const src=ctx.createBufferSource();src.buffer=ab;src.connect(ctx.destination);src.start();
-    stat(`граю ${(pcm.length/sr).toFixed(1)}с — ${bytes.length}B, ${nblk} блоків (${cfg().name})…`);
-    tele('TX',`${bytes.length}B ${nblk}блк ${cfg().name} ${(pcm.length/sr).toFixed(1)}с sr=${sr}`);
-    src.onended=()=>stat(`відіграв ${nblk} блоків. на приймачі тисни СТОП, потім грай ще раз якщо не всі зловились.`,'ok');
-  }catch(e){stat('TX помилка: '+e.message,'err');}
+    txSource=ctx.createBufferSource();txSource.buffer=ab;txSource.connect(ctx.destination);txSource.start();
+    document.getElementById('send').textContent='■ ЗУПИНИТИ';
+    stat(`граю ${durS.toFixed(1)}с — ${bytes.length}B, ${nblk} блоків (${cfg().name}) | ~${netBps.toFixed(0)} Б/с (${netbps.toFixed(0)} біт/с)`);
+    tele('TX',`${bytes.length}B ${nblk}блк ${cfg().name} ${durS.toFixed(1)}с ${netBps.toFixed(0)}Б/с sr=${sr}`);
+    txSource.onended=()=>{ txSource=null; document.getElementById('send').textContent='▶ ГРАТИ ЗВУК'; stat(`відіграв ${nblk} блоків за ${durS.toFixed(1)}с (~${netBps.toFixed(0)} Б/с). на приймачі тисни СТОП; не всі зловив — грай ще раз.`,'ok'); };
+  }catch(e){stat('TX помилка: '+e.message,'err'); stopTx();}
 };
 
 /* ============================ RX ============================ */
