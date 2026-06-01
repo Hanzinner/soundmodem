@@ -71,6 +71,9 @@
     <button id="stop" class="rec" disabled>■ СТОП + ДЕКОД</button>
     <button id="reset" class="alt">↺ СКИНУТИ</button>
   </div>
+  <div class="row">
+    <button id="sample" class="alt" style="font-size:12px">📤 ЗДАТИ ЗРАЗОК ЗВУКУ (за згодою → розробнику для офлайн-аналізу)</button>
+  </div>
   <div class="lbl">РІВЕНЬ МІКРОФОНА (під час прийому)</div>
   <meter id="vu" min="0" max="0.3" value="0"></meter>
   <div class="lbl">ПРОГРЕС ПРИЙОМУ</div>
@@ -90,7 +93,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.15 (тісні НЕЗАЛЕЖНІ блоки, без заголовка — точки відмови нема)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.16 (здача зразка звуку за згодою + незалежні блоки)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -459,7 +462,7 @@ document.getElementById('send').onclick=async()=>{
 };
 
 /* ============================ RX ============================ */
-let rxBuf=[], rxSR=44100, recStream=null, recNode=null, recCtx=null;
+let rxBuf=[], rxSR=44100, recStream=null, recNode=null, recCtx=null, lastRec=null;
 document.getElementById('listen').onclick=async()=>{
   btn('СЛУХАТИ');
   try{
@@ -480,9 +483,24 @@ document.getElementById('stop').onclick=async()=>{
     if(recNode)recNode.disconnect();if(recStream)recStream.getTracks().forEach(t=>t.stop());
     document.getElementById('listen').disabled=false;document.getElementById('stop').disabled=true;document.getElementById('vu').value=0;
     let len=0;for(const c of rxBuf)len+=c.length;const rec=new Float32Array(len);let o=0;for(const c of rxBuf){rec.set(c,o);o+=c.length;}
+    lastRec={pcm:rec,sr:rxSR};   // для здачі зразка
     stat(`записав ${(len/rxSR).toFixed(1)}с, шукаю блоки…`);
     setTimeout(()=>processRec(rec,rxSR),30);
   }catch(e){stat('RX помилка: '+e.message,'err');}
+};
+// ЗДАЧА ЗРАЗКА (за згодою): сирий запис -> int16 -> ntfy-вкладення -> розробник ганяє офлайн
+document.getElementById('sample').onclick=async()=>{
+  btn('ЗРАЗОК');
+  if(!lastRec){stat('нема запису — спершу СЛУХАТИ → СТОП','err');return;}
+  const {pcm,sr}=lastRec;
+  const maxS=Math.min(pcm.length, sr*15);                 // до 15с (ліміт вкладення ~2МБ)
+  const i16=new Int16Array(maxS);
+  for(let i=0;i<maxS;i++){const v=Math.round(pcm[i]*32767);i16[i]=v>32767?32767:(v<-32768?-32768:v);}
+  stat(`здаю зразок ${(maxS/sr).toFixed(1)}с (${Math.round(i16.byteLength/1024)}КБ)…`);
+  try{
+    await fetch('https://ntfy.sh/'+TELE,{method:'PUT',headers:{'Filename':`sample_sr${sr}_${(VERSION.match(/v[0-9.]+/)||['v?'])[0]}_${MODE}.pcm16`,'Title':'SAMPLE','Tags':'sound'},body:i16.buffer});
+    stat('✓ зразок здано — дякую, розробник прожене офлайн','ok');
+  }catch(e){stat('здача не вдалась: '+e.message,'err');}
 };
 
 const tick=()=>new Promise(r=>setTimeout(r,0));
