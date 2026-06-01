@@ -45,11 +45,14 @@
   <div class="lbl">ПЕРЕДАТИ — текст або файл</div>
   <textarea id="msg" placeholder="напиши повідомлення…">hanz beer</textarea>
   <div class="row">
-    <input id="file" type="file" style="flex:1 1 100%; color:#888; font-size:12px">
+    <input id="file" type="file" style="flex:1 1 70%; color:#888; font-size:12px">
+    <button id="clrfile" class="alt" style="flex:1 1 25%; padding:8px; font-size:12px">× файл</button>
   </div>
+  <div class="lbl" id="srcInfo" style="color:#9ca3af">надсилаю: <b>текст</b></div>
   <div class="row">
     <button id="send">▶ ГРАТИ ЗВУК</button>
   </div>
+  <progress id="txbar" max="1" value="0" style="width:100%;height:8px;display:none"></progress>
 
   <div class="lbl">ПРИЙНЯТИ (другий пристрій, або цей же)</div>
   <div class="row">
@@ -58,6 +61,7 @@
     <button id="reset" class="alt">↺ СКИНУТИ</button>
   </div>
   <meter id="vu" min="0" max="0.3" value="0"></meter>
+  <div class="prog" id="counts"></div>
   <div class="prog" id="prog"></div>
   <div class="blocks" id="blocks"></div>
   <div class="lbl">ОТРИМАНО</div>
@@ -70,7 +74,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.8 (телеметрія: кнопки+аудіосигнатура)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.9 (прогрес-бар, живі блоки, фікс файл/текст, без зависань)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -183,19 +187,27 @@ function findPeaks(rec,sr){
   const ch=chirp(sr), blockLen=preN+n+nsym*n+Math.round(sr*GAP);
   const ps=new Float64Array(rec.length+1); for(let i=0;i<rec.length;i++)ps[i+1]=ps[i]+rec[i]*rec[i];
   const lim=rec.length-preN-n-nsym*n; if(lim<=0)return [];
-  const score=new Float32Array(Math.ceil(lim/2));
-  for(let p=0,si=0;p<lim;p+=2,si++){let s=0;for(let i=0;i<preN;i+=2)s+=rec[p+i]*ch[i];const e=ps[p+preN]-ps[p];score[si]=e>1e-9?Math.abs(s)/Math.sqrt(e):0;}
-  // жадібний відбір локальних максимумів > поріг, рознесених на ~blockLen
-  const THR=0.45, minGap=Math.round(blockLen*0.7/2);
+  const STEP=3;
+  // ЕНЕРГЕТИЧНИЙ ГЕЙТ: вікно енергії з prefix-sum (O(1)) -> корелюємо ЛИШЕ де є сигнал.
+  // Інакше пошук по 3-хв запису = мільярди операцій -> браузер вішається (баг зловлено).
+  let maxE=0; for(let p=0;p<lim;p+=64){const e=ps[p+preN]-ps[p];if(e>maxE)maxE=e;}
+  const eGate=0.05*maxE;
+  const score=new Float32Array(Math.ceil(lim/STEP)); const cand=[];
+  const THR=0.45;
+  for(let p=0,si=0;p<lim;p+=STEP,si++){
+    if(ps[p+preN]-ps[p]<eGate){continue;}               // тиша/слабко -> пропускаємо дорогу кореляцію
+    let s=0;for(let i=0;i<preN;i+=2)s+=rec[p+i]*ch[i];
+    const e=ps[p+preN]-ps[p], sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0;
+    score[si]=sc; if(sc>=THR)cand.push(si);
+  }
+  const minGap=Math.round(blockLen*0.7/STEP);
   const used=new Uint8Array(score.length), peaks=[];
-  const order=[...score.keys()].sort((a,b)=>score[b]-score[a]);
-  for(const si of order){
-    if(score[si]<THR)break;
+  cand.sort((a,b)=>score[b]-score[a]);                  // лише кандидати > поріг (швидко)
+  for(const si of cand){
     if(used[si])continue;
-    let p=si*2;
-    // уточнити ±2 семпли
-    let best=p,bv=score[si];
-    for(let q=Math.max(0,p-2);q<=p+2;q++){let s=0;for(let i=0;i<preN;i++)s+=rec[q+i]*ch[i];const e=ps[q+preN]-ps[q];const sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0;if(sc>bv){bv=sc;best=q;}}
+    const p0=si*STEP;
+    let best=p0,bv=score[si];
+    for(let q=Math.max(0,p0-STEP);q<=p0+STEP;q++){let s=0;for(let i=0;i<preN;i++)s+=rec[q+i]*ch[i];const e=ps[q+preN]-ps[q];const sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0;if(sc>bv){bv=sc;best=q;}}
     peaks.push({p:best, sc:bv});
     for(let j=Math.max(0,si-minGap);j<Math.min(score.length,si+minGap);j++)used[j]=1;
   }
@@ -255,11 +267,19 @@ document.getElementById('mSafe').onclick=()=>setMode('safe');
 
 /* ============================ TX ============================ */
 let txFile=null;
-document.getElementById('file').onchange=async e=>{const f=e.target.files[0];if(!f){txFile=null;return;}txFile=new Uint8Array(await f.arrayBuffer());txFile._name=f.name;stat(`файл: ${f.name} ${txFile.length}B`);};
+function setSrc(){
+  const e=document.getElementById('srcInfo');
+  if(txFile) e.innerHTML=`надсилаю: <b style="color:#f59e0b">ФАЙЛ ${txFile._name} ${txFile.length}B</b>`;
+  else e.innerHTML='надсилаю: <b>текст</b>';
+}
+document.getElementById('file').onchange=async e=>{const f=e.target.files[0];if(!f){txFile=null;setSrc();return;}txFile=new Uint8Array(await f.arrayBuffer());txFile._name=f.name;setSrc();stat(`файл обрано: ${f.name} ${txFile.length}B`);};
+document.getElementById('clrfile').onclick=()=>{txFile=null;document.getElementById('file').value='';setSrc();stat('файл прибрано — надсилатиму текст.');};
+// друкуєш текст -> файл скидається (інакше шле старий файл, не текст: причина "ієрогліфів")
+document.getElementById('msg').addEventListener('input',()=>{ if(txFile){txFile=null;document.getElementById('file').value='';setSrc();} });
 let actx=null;
 async function getCtx(){if(!actx)actx=new(window.AudioContext||window.webkitAudioContext)();if(actx.state==='suspended')await actx.resume();return actx;}
 let txSource=null;
-function stopTx(){ if(txSource){try{txSource.stop();}catch(e){} txSource=null;} document.getElementById('send').textContent='▶ ГРАТИ ЗВУК'; }
+function stopTx(){ if(txSource){try{txSource.stop();}catch(e){} txSource=null;} document.getElementById('send').textContent='▶ ГРАТИ ЗВУК'; const b=document.getElementById('txbar'); if(b)b.style.display='none'; }
 document.getElementById('send').onclick=async()=>{
   if(txSource){ btn('ГРАТИ→ЗУПИНИТИ'); stopTx(); stat('зупинено.'); return; }   // друге натискання = стоп
   btn('ГРАТИ');
@@ -273,11 +293,15 @@ document.getElementById('send').onclick=async()=>{
     const durS=pcm.length/sr;
     const netBps=bytes.length/durS, netbps=netBps*8;        // корисна швидкість (файл/час)
     const ab=ctx.createBuffer(1,pcm.length,sr);ab.getChannelData(0).set(pcm);
-    txSource=ctx.createBufferSource();txSource.buffer=ab;txSource.connect(ctx.destination);txSource.start();
+    txSource=ctx.createBufferSource();txSource.buffer=ab;txSource.connect(ctx.destination);
+    const t0=ctx.currentTime; txSource.start();
     document.getElementById('send').textContent='■ ЗУПИНИТИ';
+    const bar=document.getElementById('txbar'); bar.style.display='block'; bar.value=0;
+    const tick=()=>{ if(!txSource){bar.style.display='none';return;} bar.value=Math.min(1,(ctx.currentTime-t0)/durS); requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
     stat(`граю ${durS.toFixed(1)}с — ${bytes.length}B, ${nblk} блоків (${cfg().name}) | ~${netBps.toFixed(0)} Б/с (${netbps.toFixed(0)} біт/с)`);
     tele('TX',`${VERSION} | ${bytes.length}B ${nblk}блк ${cfg().name} ${durS.toFixed(1)}с ${netBps.toFixed(0)}Б/с sr=${sr}`);
-    txSource.onended=()=>{ txSource=null; document.getElementById('send').textContent='▶ ГРАТИ ЗВУК'; stat(`відіграв ${nblk} блоків за ${durS.toFixed(1)}с (~${netBps.toFixed(0)} Б/с). на приймачі тисни СТОП; не всі зловив — грай ще раз.`,'ok'); };
+    txSource.onended=()=>{ txSource=null; document.getElementById('send').textContent='▶ ГРАТИ ЗВУК'; bar.value=1; setTimeout(()=>bar.style.display='none',400); stat(`відіграв ${nblk} блоків за ${durS.toFixed(1)}с (~${netBps.toFixed(0)} Б/с). на приймачі тисни СТОП; не всі зловив — грай ще раз.`,'ok'); };
   }catch(e){stat('TX помилка: '+e.message,'err'); stopTx();}
 };
 
@@ -308,11 +332,25 @@ document.getElementById('stop').onclick=async()=>{
   }catch(e){stat('RX помилка: '+e.message,'err');}
 };
 
-function processRec(rec,sr){
+const tick=()=>new Promise(r=>setTimeout(r,0));
+function updCounts(newOk,fails,tot,done){
+  const have=recv.map.size, T=recv.total;
+  document.getElementById('counts').textContent=
+    `зловлено: ${have}${T?'/'+T:''} | цей прохід: +${newOk} нових, ${fails} пошкоджених | оброблено ${done}/${tot} чирпів`;
+}
+async function processRec(rec,sr){
+  setProg('шукаю чирпи…'); await tick();
   const peaks=findPeaks(rec,sr);
-  let newOk=0, seen=0, errs=[], fails=0;
-  for(const {p,sc} of peaks){const dec=decodeBlockAt(rec,sr,p);seen++;if(dec&&dec.ok)errs.push(dec.nerr);else fails++;if(ingestBlock(dec))newOk++;}
-  renderBlocks();
+  setProg(`знайдено ${peaks.length} чирпів, декодую…`); await tick();
+  let newOk=0, errs=[], fails=0;
+  for(let bi=0;bi<peaks.length;bi++){
+    const dec=decodeBlockAt(rec,sr,peaks[bi].p);
+    if(dec&&dec.ok)errs.push(dec.nerr);else fails++;
+    if(ingestBlock(dec))newOk++;
+    if(bi%2===0){ renderBlocks(); updCounts(newOk,fails,peaks.length,bi+1); await tick(); }  // живо + не вішає UI
+  }
+  renderBlocks(); updCounts(newOk,fails,peaks.length,peaks.length);
+  const seen=peaks.length;
   const have=recv.map.size, tot=recv.total;
   const dur=(rec.length/sr).toFixed(1);
   let peak=0; for(let i=0;i<rec.length;i++){const a=Math.abs(rec[i]);if(a>peak)peak=a;}
