@@ -33,7 +33,7 @@
 </style>
 </head>
 <body>
-  <h1>HANZ SOUND MODEM <span style="color:#555">DEV (RS+блоки+накопичення)</span></h1>
+  <h1>HANZ SOUND MODEM <span style="color:#555" id="ver">DEV</span></h1>
   <p class="sub">файл/текст → звук → назад, з корекцією помилок (Reed-Solomon) і накопиченням блоків через повтори.</p>
 
   <div class="lbl">РЕЖИМ</div>
@@ -70,6 +70,7 @@
 
 <script>
 "use strict";
+const VERSION="web-dev v0.7 (RS+блоки+накопичення, 20 несучих)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -257,7 +258,7 @@ document.getElementById('send').onclick=async()=>{
     txSource=ctx.createBufferSource();txSource.buffer=ab;txSource.connect(ctx.destination);txSource.start();
     document.getElementById('send').textContent='■ ЗУПИНИТИ';
     stat(`граю ${durS.toFixed(1)}с — ${bytes.length}B, ${nblk} блоків (${cfg().name}) | ~${netBps.toFixed(0)} Б/с (${netbps.toFixed(0)} біт/с)`);
-    tele('TX',`${bytes.length}B ${nblk}блк ${cfg().name} ${durS.toFixed(1)}с ${netBps.toFixed(0)}Б/с sr=${sr}`);
+    tele('TX',`${VERSION} | ${bytes.length}B ${nblk}блк ${cfg().name} ${durS.toFixed(1)}с ${netBps.toFixed(0)}Б/с sr=${sr}`);
     txSource.onended=()=>{ txSource=null; document.getElementById('send').textContent='▶ ГРАТИ ЗВУК'; stat(`відіграв ${nblk} блоків за ${durS.toFixed(1)}с (~${netBps.toFixed(0)} Б/с). на приймачі тисни СТОП; не всі зловив — грай ще раз.`,'ok'); };
   }catch(e){stat('TX помилка: '+e.message,'err'); stopTx();}
 };
@@ -337,6 +338,7 @@ document.getElementById('selftest').onclick=()=>{
   setProg(`самотест: ${nblk} блоків, чирпів знайдено ${peaks.length}, зловлено ${recv.map.size}/${nblk}`);
   stat(pass?`🧪 САМОТЕСТ ПРОЙДЕНО — ${data.length}B байт-у-байт через шум`:'🧪 САМОТЕСТ ВПАВ',pass?'ok':'err');
 };
+document.getElementById('ver').textContent=VERSION;
 </script>
 </body>
 </html>
