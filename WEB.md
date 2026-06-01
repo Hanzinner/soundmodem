@@ -79,7 +79,36 @@ language and the runtime are different. Three divergences are forced by physics,
 3. **ARQ by replay, not one-machine.** Desktop loopback is one program that already knows which
    blocks failed; two phones need the human-in-the-loop replay accumulation above.
 
+## Current state & findings (2026-06)
+
+The dev page has iterated to **v0.10**: Reed-Solomon, block accumulation, telemetry (button
+events + an audio signature: per-carrier levels, a coarse spectrum, sync strength, RS errors),
+a TX progress bar, a live block grid, and a **visible per-carrier spectrum** so the channel's
+alive/dead carriers are seen in-UI.
+
+Real-hardware testing surfaced the core limit, and two offline proofs framed the fix:
+
+- **Flat, blind OOK fails on a real narrow channel.** On a laptop loopback the recorded signal
+  was weak (peak ~0.04) and only the ~900–1300 Hz carriers were alive; the rest sat at noise.
+  Chirp sync found every block, but 0 decoded — the dead carriers still occupy bit-slots and
+  poison every byte beyond RS's reach (~32% bit-error, reproduced offline against the real
+  per-carrier signature).
+- **Receiver-side gain/EQ alone can't fix it.** Dropping dead carriers at the receiver doesn't
+  help, because the transmitter already committed data to them. The fix requires the
+  **transmitter to know the channel** — which means a **probe round**.
+- **The high band is where the bandwidth is.** The desktop modem gets its throughput from
+  8–20 kHz with per-carrier pre-emphasis and gating. The web port currently neither uses that
+  band nor pre-emphasises, so high carriers roll off and die. Same hardware, different result —
+  it's adaptation, not physics.
+- **Two crystals are correctable.** Offline, a 180 ppm sample-rate offset between two devices was
+  estimated to 0.1 ppm from a pilot and resampled out, leaving 0.3° of residual phase drift over
+  a whole transfer — enough to make phase modulation (QPSK) viable across two devices.
+
 ## Roadmap (web)
-- Sample-clock offset estimation (ppm) so longer files don't drift between two crystals.
-- Ultrasonic (~19 kHz) "silent mode" toggle — quiet transmission, narrower band / slower.
-- Wider band once a phone's real clean range is measured per-device.
+The next build is a **probe round** (a short handshake), which unlocks several things at once:
+- Measure the channel per carrier, **gate** dead carriers, **pre-emphasise** weak-but-live ones.
+- **Extend into the 8–20 kHz band** and keep whatever the probe confirms (per-device, since some
+  phone browsers resample mic input down to ~16 kHz).
+- On two devices, the same handshake carries **sample-clock (ppm) correction** → phase modulation
+  → per-carrier **bit-loading**, plus a real back-channel for ARQ.
+- Optional ultrasonic (~19 kHz) "silent mode" once the band is probe-driven.
