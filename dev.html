@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.20 (probe: викинуто рівневий гейт 0.20*maxLv — лишився SNR+error; pre-emphasis тягне слабкі-чисті)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.21 (здача зразка = локальне скачування + чесний статус ntfy; квота ntfy більше не бреше «долетіло»)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -526,12 +526,22 @@ document.getElementById('sample').onclick=async()=>{
   const maxS=Math.min(pcm.length, sr*15);                 // до 15с (ліміт вкладення ~2МБ)
   const i16=new Int16Array(maxS);
   for(let i=0;i<maxS;i++){const v=Math.round(pcm[i]*32767);i16[i]=v>32767?32767:(v<-32768?-32768:v);}
+  const fname=`sample_sr${sr}_${(VERSION.match(/v[0-9.]+/)||['v?'])[0]}_${MODE}_${shortUA().replace('/','-')}.pcm16`;
   stat(`здаю зразок ${(maxS/sr).toFixed(1)}с (${Math.round(i16.byteLength/1024)}КБ)…`);
+  // 1) НАДІЙНО: локальне скачування (не б'є жодну квоту). Кидаєш файл у Syncthing-папку -> прилітає розробнику.
   try{
-    await fetch('https://ntfy.sh/'+TELE,{method:'PUT',headers:{'Filename':`sample_sr${sr}_${(VERSION.match(/v[0-9.]+/)||['v?'])[0]}_${MODE}_${shortUA().replace('/','-')}.pcm16`,'Title':'SAMPLE','Tags':'sound'},body:i16.buffer});
-    stat('✓ зразок здано','ok');
-    document.getElementById('sampleinfo').textContent=`✓ останній запис (${(maxS/sr).toFixed(1)}с) надіслано розробнику — дякую`;
-  }catch(e){stat('здача не вдалась: '+e.message,'err');}
+    const blob=new Blob([i16.buffer],{type:'application/octet-stream'});
+    const url=URL.createObjectURL(blob); const a=document.createElement('a');
+    a.href=url; a.download=fname; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),2000);
+    document.getElementById('sampleinfo').textContent=`⬇ ${fname} скачано (${(maxS/sr).toFixed(1)}с) — кинь у Syncthing-папку`;
+  }catch(e){ document.getElementById('sampleinfo').textContent='скачування не вдалось: '+e.message; }
+  // 2) ДОДАТКОВО: ntfy (якщо квота жива) — тепер з ПЕРЕВІРКОЮ реального статусу, без брехні
+  try{
+    const r=await fetch('https://ntfy.sh/'+TELE,{method:'PUT',headers:{'Filename':fname,'Title':'SAMPLE','Tags':'sound'},body:i16.buffer});
+    if(r.ok) stat('✓ зразок здано (скачано + ntfy)','ok');
+    else stat(`скачано локально; ntfy відмовив HTTP ${r.status} (квота) — кинь файл у Syncthing`,'err');
+  }catch(e){ stat('скачано локально; ntfy недоступний — кинь файл у Syncthing','err'); }
 };
 
 const tick=()=>new Promise(r=>setTimeout(r,0));
