@@ -64,6 +64,7 @@
     <button id="send">▶ ГРАТИ ЗВУК</button>
   </div>
   <progress id="txbar" max="1" value="0" style="width:100%;height:8px;display:none"></progress>
+  <div class="prog" id="speed" style="color:#22c55e"></div>
 
   <div class="lbl">ПРИЙНЯТИ (другий пристрій, або цей же)</div>
   <div class="row">
@@ -72,8 +73,9 @@
     <button id="reset" class="alt">↺ СКИНУТИ</button>
   </div>
   <div class="row">
-    <button id="sample" class="alt" style="font-size:12px">📤 ЗДАТИ ЗРАЗОК ЗВУКУ (за згодою → розробнику для офлайн-аналізу)</button>
+    <button id="sample" class="alt" style="font-size:12px">📤 ЗДАТИ ЗРАЗОК (останній запис → розробнику)</button>
   </div>
+  <div class="stat" id="sampleinfo" style="font-size:11px"></div>
   <div class="lbl">РІВЕНЬ МІКРОФОНА (під час прийому)</div>
   <meter id="vu" min="0" max="0.3" value="0"></meter>
   <div class="lbl">ПРОГРЕС ПРИЙОМУ</div>
@@ -93,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.16 (здача зразка звуку за згодою + незалежні блоки)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.17 (телеметрія: пристрій/UA; швидкість і підтвердження зразка біля кнопок)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -142,7 +144,14 @@ const setProg=s=>document.getElementById('prog').textContent=s;
 /* ---- авто-телеметрія (тільки цифри) -> ntfy, Hanz обрав топік ---- */
 const TELE="hanz-soundmodem-x7k92q";
 function tele(t,b){if(!TELE)return;try{fetch('https://ntfy.sh/'+TELE,{method:'POST',headers:{'Title':t,'Tags':'sound'},body:String(b).slice(0,1200)});}catch(e){}}
-function btn(name){tele('BTN',`${name} | ${MODE}`);}   // які кнопки натиснуті — видно коли зупинили
+// короткий тег пристрою/браузера для кореляції звідки звіт
+const UA=(typeof navigator!=='undefined'?navigator.userAgent:'');
+function shortUA(){
+  let os=/Android/.test(UA)?'Android':/iPhone|iPad/.test(UA)?'iOS':/Windows/.test(UA)?'Win':/Mac/.test(UA)?'Mac':/Linux/.test(UA)?'Linux':'?';
+  let br=/Firefox/.test(UA)?'FF':/Edg/.test(UA)?'Edge':/Chrome/.test(UA)?'Chrome':/Safari/.test(UA)?'Safari':'?';
+  return os+'/'+br;
+}
+function btn(name){tele('BTN',`${name} | ${MODE} | ${shortUA()}`);}   // які кнопки + пристрій
 
 /* ============================ біти/crc ============================ */
 function bytesToBits(b){const o=[];for(const by of b)for(let i=0;i<8;i++)o.push((by>>i)&1);return o;}
@@ -448,6 +457,7 @@ document.getElementById('send').onclick=async()=>{
     const pcm=buildSignal(blocks,sr);
     const durS=pcm.length/sr;
     const netBps=bytes.length/durS, netbps=netBps*8;        // корисна швидкість (файл/час)
+    document.getElementById('speed').textContent=`швидкість: ~${netBps.toFixed(0)} Б/с (${netbps.toFixed(0)} біт/с) | ${bytes.length}Б за ${durS.toFixed(1)}с, ${nblk} блок`;
     const ab=ctx.createBuffer(1,pcm.length,sr);ab.getChannelData(0).set(pcm);
     txSource=ctx.createBufferSource();txSource.buffer=ab;txSource.connect(ctx.destination);
     const t0=ctx.currentTime; txSource.start();
@@ -498,8 +508,9 @@ document.getElementById('sample').onclick=async()=>{
   for(let i=0;i<maxS;i++){const v=Math.round(pcm[i]*32767);i16[i]=v>32767?32767:(v<-32768?-32768:v);}
   stat(`здаю зразок ${(maxS/sr).toFixed(1)}с (${Math.round(i16.byteLength/1024)}КБ)…`);
   try{
-    await fetch('https://ntfy.sh/'+TELE,{method:'PUT',headers:{'Filename':`sample_sr${sr}_${(VERSION.match(/v[0-9.]+/)||['v?'])[0]}_${MODE}.pcm16`,'Title':'SAMPLE','Tags':'sound'},body:i16.buffer});
-    stat('✓ зразок здано — дякую, розробник прожене офлайн','ok');
+    await fetch('https://ntfy.sh/'+TELE,{method:'PUT',headers:{'Filename':`sample_sr${sr}_${(VERSION.match(/v[0-9.]+/)||['v?'])[0]}_${MODE}_${shortUA().replace('/','-')}.pcm16`,'Title':'SAMPLE','Tags':'sound'},body:i16.buffer});
+    stat('✓ зразок здано','ok');
+    document.getElementById('sampleinfo').textContent=`✓ останній запис (${(maxS/sr).toFixed(1)}с) надіслано розробнику — дякую`;
   }catch(e){stat('здача не вдалась: '+e.message,'err');}
 };
 
@@ -530,7 +541,7 @@ async function processRec(rec,sr){
   const cSig=peaks.length?carrierSig(rec,sr,peaks[0].p):'-';
   const sSig=specSig(rec,sr);
   // АУДІОСИГНАТУРА: дає ПОВНУ картину каналу навіть коли 0 блоків
-  const sig=`${VERSION}|${cfg().name} sr=${sr} dur=${dur}s pk=${peak.toFixed(3)} chirps=${peaks.length} blkB=${recv.chunk||'?'} sync=[${syncTop}] blk=${have}/${tot||'?'} +${newOk} fail=${fails} rsErr~${avgErr} | carr=${cSig} | spec=${sSig}`;
+  const sig=`${VERSION}|${cfg().name} ${shortUA()} sr=${sr} dur=${dur}s pk=${peak.toFixed(3)} chirps=${peaks.length} blkB=${recv.chunk||'?'} sync=[${syncTop}] blk=${have}/${tot||'?'} +${newOk} fail=${fails} rsErr~${avgErr} | carr=${cSig} | spec=${sSig}`;
   const asm=tryAssemble();
   if(asm&&!asm.bad){
     finish(asm);
@@ -578,6 +589,7 @@ document.getElementById('selftest').onclick=()=>{
   stat(pass?`🧪 САМОТЕСТ ПРОЙДЕНО — ${data.length}B байт-у-байт через шум`:'🧪 САМОТЕСТ ВПАВ',pass?'ok':'err');
 };
 document.getElementById('ver').textContent=VERSION;
+tele('DEVICE',`${UA} | екран ${screen.width}x${screen.height} | ${VERSION}`);   // хто/на чому — раз на сесію
 </script>
 </body>
 </html>
