@@ -90,7 +90,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.11 (PROBE-раунд: адаптація до каналу, повний спектр до 20-23к)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.12 (PROBE фікс: окремий замір шуму + строгий SNR-гейт)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -302,8 +302,12 @@ async function probe(){
   const node=rc.createScriptProcessor(4096,1,1);
   node.onaudioprocess=e=>buf.push(new Float32Array(e.inputBuffer.getChannelData(0)));
   src.connect(node); node.connect(rc.destination);
-  stat('🎯 ПРОБ: граю зонд по всьому спектру (300–'+CAND_HI/1000+'к)…');
-  await new Promise(r=>setTimeout(r,200));                 // лід-тиша -> шумова підлога
+  // ФАЗА 1: ТИША -> надійна шумова підлога (окремо, як desktop A0)
+  stat('🎯 ПРОБ (1/2): міряю шум — ТИХО 0.5с…');
+  await new Promise(r=>setTimeout(r,500));
+  let silLen=0; for(const c of buf) silLen+=c.length;
+  // ФАЗА 2: зонд по всьому спектру
+  stat('🎯 ПРОБ (2/2): граю зонд 300–'+CAND_HI/1000+'к…');
   const pctx=await getCtx(); const psr=pctx.sampleRate;
   const pcm=buildProbe(psr);
   const ab=pctx.createBuffer(1,pcm.length,psr); ab.getChannelData(0).set(pcm);
@@ -311,36 +315,41 @@ async function probe(){
   await new Promise(r=>setTimeout(r,(pcm.length/psr+0.4)*1000));
   node.disconnect(); stream.getTracks().forEach(t=>t.stop());
   let len=0; for(const c of buf) len+=c.length; const rec=new Float32Array(len); let o=0; for(const c of buf){rec.set(c,o);o+=c.length;}
-  applyProbe(rec,sr);
+  applyProbe(rec,sr,silLen);
 }
-function applyProbe(rec,sr){
+function applyProbe(rec,sr,silLen){
   const nn=Math.round(sr*cfg().BIT), preN=Math.round(sr*PRE_DUR);
+  // ШУМ з фази тиші (повне вікно, перенормовано на символ)
+  const sN=Math.max(nn,Math.min(silLen,Math.round(sr*0.45)));
+  const noise=CAND.map(f=>{let I=0,Q=0;for(let i=0;i<sN;i++){const t=2*Math.PI*f*i/sr;I+=rec[i]*Math.sin(t);Q+=rec[i]*Math.cos(t);}return Math.hypot(I,Q)/sN*nn;});
+  // СИНК у фазі зонда (після тиші)
   const ch=chirp(sr), ps=new Float64Array(rec.length+1);
   for(let i=0;i<rec.length;i++)ps[i+1]=ps[i]+rec[i]*rec[i];
-  const lim=rec.length-preN-nn; if(lim<=0){stat('ПРОБ: запис закороткий','err');return;}
+  const lim=rec.length-preN-nn, st=Math.max(0,silLen-nn);
   let best=-1,bv=-1;
-  for(let p=0;p<lim;p+=2){let s=0;for(let i=0;i<preN;i+=2)s+=rec[p+i]*ch[i];const e=ps[p+preN]-ps[p];const sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0;if(sc>bv){bv=sc;best=p;}}
+  for(let p=st;p<lim;p+=2){let s=0;for(let i=0;i<preN;i+=2)s+=rec[p+i]*ch[i];const e=ps[p+preN]-ps[p];const sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0;if(sc>bv){bv=sc;best=p;}}
   if(best<0){stat('ПРОБ: зонд не почуто — гучніше/ближче','err');return;}
-  const calibAt=best+preN, nWin=Math.max(1,Math.min(best,nn));
-  const noise=CAND.map(f=>{let I=0,Q=0;for(let i=0;i<nWin;i++){const t=2*Math.PI*f*i/sr;I+=rec[i]*Math.sin(t);Q+=rec[i]*Math.cos(t);}return Math.hypot(I,Q)/nWin*nn;});
+  const calibAt=best+preN;
   const lv=CAND.map(f=>{let I=0,Q=0;for(let i=0;i<nn;i++){const t=2*Math.PI*f*i/sr;I+=rec[calibAt+i]*Math.sin(t);Q+=rec[calibAt+i]*Math.cos(t);}return Math.hypot(I,Q);});
-  const nmed=median(noise), GATE=4;
-  const activeIdx=[]; for(let c=0;c<CAND.length;c++) if(lv[c]>GATE*Math.max(noise[c],nmed)) activeIdx.push(c);
-  const aset=new Set(activeIdx);
-  renderProbe(lv,noise,aset);
+  const maxLv=Math.max(...lv,1e-9);
+  // СТРОГИЙ ГЕЙТ: SNR проти ШУМУ ≥6 (≈15дБ, надійно для OOK) ТА ≥20% від найсильнішої несучої
+  const GATE=6;
+  const activeIdx=[]; for(let c=0;c<CAND.length;c++){ const snr=lv[c]/Math.max(noise[c],1e-9); if(snr>=GATE && lv[c]>0.20*maxLv) activeIdx.push(c); }
+  renderProbe(lv,noise,new Set(activeIdx));
+  if(bv<20) document.getElementById('probeinfo').textContent=`⚠ слабкий синк зонда (${bv.toFixed(0)}) — вимір ненадійний, гучніше. `;
   if(activeIdx.length<4){
-    document.getElementById('probeinfo').textContent=`лише ${activeIdx.length} живих несучих — гучніше/ближче, тоді ПРОБ знову`;
-    stat('ПРОБ: канал надто тихий/вузький','err'); return;
+    document.getElementById('probeinfo').textContent+=`лише ${activeIdx.length} надійних несучих (SNR≥6). Гучніше/ближче, тоді ПРОБ.`;
+    stat('ПРОБ: мало надійних несучих','err'); return;
   }
   const amax=Math.max(...activeIdx.map(c=>lv[c]));
   FREQS=activeIdx.map(c=>CAND[c]);
-  GTX=activeIdx.map(c=>Math.min(4,amax/Math.max(lv[c],1e-9)));
+  GTX=activeIdx.map(c=>Math.min(2.5,amax/Math.max(lv[c],1e-9)));   // помірний pre-emphasis (не воскрешати шум)
   NCAR=FREQS.length; PROBED=true; resetRecv();
   document.getElementById('probe').classList.add('on');
   const band=`${FREQS[0]}–${FREQS[FREQS.length-1]} Гц`;
-  document.getElementById('probeinfo').textContent=`✓ ${NCAR} живих несучих, смуга ${band}. Тепер ГРАТИ — піде адаптивно по всіх живих.`;
-  stat(`✓ ПРОБ: ${NCAR} несучих, ${band}`,'ok');
-  tele('PROBE',`${VERSION}|active=${NCAR}/${CAND.length} band=${band} sr=${sr} sync=${bv.toFixed(1)} hi=${CAND_HI}`);
+  document.getElementById('probeinfo').textContent=`✓ ${NCAR} надійних несучих (SNR≥6), смуга ${band}. ГРАТИ → адаптивно.`;
+  stat(`✓ ПРОБ: ${NCAR} несучих, ${band}, синк ${bv.toFixed(0)}`,'ok');
+  tele('PROBE',`${VERSION}|active=${NCAR}/${CAND.length} band=${band} sr=${sr} sync=${bv.toFixed(1)} maxLv=${maxLv.toFixed(0)} hi=${CAND_HI}`);
 }
 document.getElementById('probe').onclick=probe;
 document.getElementById('unlock').onclick=()=>{
