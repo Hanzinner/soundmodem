@@ -90,7 +90,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.13 (фікс: спектр стискається під екран; SNR-гейт)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.14 (тісний RS-блок під розмір: hanz beer 9.5с -> 2.6с)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -146,71 +146,79 @@ function bytesToBits(b){const o=[];for(const by of b)for(let i=0;i<8;i++)o.push(
 function bitsToBytes(bits,nb){const o=new Uint8Array(nb);for(let j=0;j<nb;j++){let v=0;for(let i=0;i<8;i++){const k=j*8+i;if(k<bits.length&&bits[k])v|=(1<<i);}o[j]=v;}return o;}
 function crc32(b){let c=~0;for(const x of b){c^=x;for(let k=0;k<8;k++)c=(c>>>1)^(0xEDB88320&-(c&1));}return(c^-1)>>>0;}
 
-/* ============================ кадр: файл -> RS-блоки ============================ */
+/* ============================ кадр: файл -> RS-блоки (ТІСНИЙ розмір під повідомлення) ============================ */
+// Раніше КОЖЕН блок = 255Б, тож 9Б «hanz beer» роздувались у 255Б -> 9.5с -> накопичення помилок.
+// Тепер блок = рівно стільки скільки треба. Розмір блока BN несе ФІКСОВАНИЙ заголовок (32Б), який
+// приймач читає першим (його розмір відомий завжди), і вже знає BN для блоків даних.
+const HPAR=28, HDATA=4, HN=HDATA+HPAR;            // заголовок: u16 nblk + u16 BN, важкий RS (28) -> 32Б
+const nsymOf=bytes=>Math.ceil(bytes*8/NCAR);      // символів на блок розміру bytes
 function makeBlocks(fileBytes){
-  const parity=cfg().parity, dlen=DATA();
-  // payload = u32(len) + u32(crc) + file
+  const parity=cfg().parity;
   const pay=new Uint8Array(8+fileBytes.length); const dv=new DataView(pay.buffer);
   dv.setUint32(0,fileBytes.length,true); dv.setUint32(4,crc32(fileBytes),true); pay.set(fileBytes,8);
-  const nblk=Math.max(1,Math.ceil(pay.length/dlen));
+  const maxChunk=(255-parity)-4;                  // -4: idx(2)+total(2)
+  const nblk=Math.max(1,Math.ceil(pay.length/maxChunk));
+  const chunk=Math.ceil(pay.length/nblk);         // байтів даних на блок (тісно)
+  const BN=chunk+4+parity;                         // розмір блока-кодслова (≤255)
+  // заголовок (32Б): nblk + BN
+  const hd=new Uint8Array(HDATA); const dvh=new DataView(hd.buffer);
+  dvh.setUint16(0,nblk,true); dvh.setUint16(2,BN,true);
+  const header=rsEncode(hd,HPAR);
+  // блоки даних: [idx][total] + chunk -> BN байт
   const blocks=[];
   for(let i=0;i<nblk;i++){
-    const plain=new Uint8Array(K());            // idx(2)+total(2)+chunk
-    const dvp=new DataView(plain.buffer);
+    const plain=new Uint8Array(4+chunk); const dvp=new DataView(plain.buffer);
     dvp.setUint16(0,i,true); dvp.setUint16(2,nblk,true);
-    const start=i*dlen, slice=pay.subarray(start,Math.min(start+dlen,pay.length));
-    plain.set(slice,4);
-    blocks.push(rsEncode(plain,parity));        // 255 байт
+    const st=i*chunk, sl=pay.subarray(st,Math.min(st+chunk,pay.length));
+    plain.set(sl,4);
+    blocks.push(rsEncode(plain,parity));
   }
-  return {blocks,nblk};
+  return {header,blocks,nblk,BN,chunk};
 }
 
 /* ============================ TX: PCM ============================ */
 function chirp(sr){const m=Math.round(sr*PRE_DUR),a=new Float32Array(m),k=(PRE_F1-PRE_F0)/PRE_DUR;for(let i=0;i<m;i++){const t=i/sr;a[i]=Math.sin(2*Math.PI*(PRE_F0*t+0.5*k*t*t));}return a;}
-function buildSignal(blocks,sr){
-  const BIT=cfg().BIT, n=Math.round(sr*BIT), fade=Math.max(4,Math.round(FADE*n)), preN=Math.round(sr*PRE_DUR);
-  const nsym=SYM_PER_BLK(), gapN=Math.round(sr*GAP);
-  const perBlk=preN+n/*calib*/+nsym*n+gapN;
-  const total=blocks.length*perBlk;
+function buildSignal(units,sr){      // units = [header, ...блоки даних]; кожен своєї довжини
+  const BIT=cfg().BIT, n=Math.round(sr*BIT), fade=Math.max(4,Math.round(FADE*n)), preN=Math.round(sr*PRE_DUR), gapN=Math.round(sr*GAP);
+  const unitLen=units.map(u=>preN+n+nsymOf(u.length)*n+gapN);
+  const total=unitLen.reduce((a,b)=>a+b,0);
   const buf=new Float32Array(total);
   const env=new Float32Array(n).fill(1); for(let i=0;i<fade;i++){env[i]=i/fade;env[n-1-i]=i/fade;}
   const ch=chirp(sr);
   const addSym=(off,mask)=>{for(let i=0;i<n;i++){let w=0;for(let c=0;c<NCAR;c++)if(mask[c])w+=GTX[c]*Math.sin(2*Math.PI*FREQS[c]*i/sr);buf[off+i]+=(w/NCAR)*env[i];}};
   const allOn=new Array(NCAR).fill(1);
   let off=0;
-  for(const blk of blocks){
+  for(let ui=0;ui<units.length;ui++){
+    const blk=units[ui], nsym=nsymOf(blk.length);
     for(let i=0;i<preN;i++)buf[off+i]+=0.6*ch[i];
     addSym(off+preN,allOn);
     const bits=bytesToBits(blk); while(bits.length%NCAR)bits.push(0);
     for(let s=0;s<nsym;s++){const mask=new Array(NCAR);for(let c=0;c<NCAR;c++)mask[c]=bits[s*NCAR+c]||0;addSym(off+preN+n+s*n,mask);}
-    off+=perBlk;
+    off+=unitLen[ui];
   }
   let pk=0;for(let i=0;i<total;i++)pk=Math.max(pk,Math.abs(buf[i]));if(pk>0){const g=0.9/pk;for(let i=0;i<total;i++)buf[i]*=g;}
   return buf;
 }
 
 /* ============================ декод одного блока з позиції p ============================ */
-function decodeBlockAt(rec,sr,p){
-  const BIT=cfg().BIT, n=Math.round(sr*BIT), preN=Math.round(sr*PRE_DUR), nsym=SYM_PER_BLK();
+function decodeUnit(rec,sr,p,unitBytes,parityN){
+  const BIT=cfg().BIT, n=Math.round(sr*BIT), preN=Math.round(sr*PRE_DUR), nsym=nsymOf(unitBytes);
   const calibAt=p+preN, dataAt=calibAt+n;
   if(dataAt+nsym*n>rec.length) return null;
-  // фаза+рівень з калібру (всі несучі ON) — re-anchor: поріг на рівень саме цього блока.
-  // ВАЖЛИВО: проєкція ЛОКАЛЬНИМ індексом i (0..n), точно як TX будує символ (фаза скидається щосимвол).
-  // Абсолютний індекс ламається на округленні n (FREQS·n/sr не ціле) — фаза розповзається по символах.
+  // фаза+рівень з калібру (всі несучі ON). ЛОКАЛЬНИЙ індекс i (фаза скидається щосимвол).
   const ph=new Array(NCAR), lvl=new Array(NCAR);
   for(let c=0;c<NCAR;c++){let I=0,Q=0;for(let i=0;i<n;i++){const t=2*Math.PI*FREQS[c]*i/sr;I+=rec[calibAt+i]*Math.sin(t);Q+=rec[calibAt+i]*Math.cos(t);}ph[c]=Math.atan2(Q,I);lvl[c]=Math.hypot(I,Q);}
   const bits=[];
   for(let s=0;s<nsym;s++){const off=dataAt+s*n;for(let c=0;c<NCAR;c++){let d=0;for(let i=0;i<n;i++){const t=2*Math.PI*FREQS[c]*i/sr;d+=rec[off+i]*(Math.cos(ph[c])*Math.sin(t)+Math.sin(ph[c])*Math.cos(t));}bits.push(d>lvl[c]*0.5?1:0);}}
-  const blk=bitsToBytes(bits,255);
-  return rsDecode(blk,cfg().parity);
+  return rsDecode(bitsToBytes(bits,unitBytes),parityN);
 }
 
 /* ============================ скан усіх чирпів у записі ============================ */
 function findPeaks(rec,sr){
-  const BIT=cfg().BIT, n=Math.round(sr*BIT), preN=Math.round(sr*PRE_DUR), nsym=SYM_PER_BLK();
-  const ch=chirp(sr), blockLen=preN+n+nsym*n+Math.round(sr*GAP);
+  const BIT=cfg().BIT, n=Math.round(sr*BIT), preN=Math.round(sr*PRE_DUR), nsymMin=nsymOf(HN);
+  const ch=chirp(sr);
   const ps=new Float64Array(rec.length+1); for(let i=0;i<rec.length;i++)ps[i+1]=ps[i]+rec[i]*rec[i];
-  const lim=rec.length-preN-n-nsym*n; if(lim<=0)return [];
+  const lim=rec.length-preN-n-nsymMin*n; if(lim<=0)return [];
   const STEP=3;
   // ЕНЕРГЕТИЧНИЙ ГЕЙТ: вікно енергії з prefix-sum (O(1)) -> корелюємо ЛИШЕ де є сигнал.
   // Інакше пошук по 3-хв запису = мільярди операцій -> браузер вішається (баг зловлено).
@@ -224,7 +232,7 @@ function findPeaks(rec,sr){
     const e=ps[p+preN]-ps[p], sc=e>1e-9?Math.abs(s)/Math.sqrt(e):0;
     score[si]=sc; if(sc>=THR)cand.push(si);
   }
-  const minGap=Math.round(blockLen*0.7/STEP);
+  const minGap=Math.round((preN+n)/STEP);   // дедуп лише ширини чирпа+калібру (блоки тепер різні)
   const used=new Uint8Array(score.length), peaks=[];
   cand.sort((a,b)=>score[b]-score[a]);                  // лише кандидати > поріг (швидко)
   for(const si of cand){
@@ -364,27 +372,27 @@ document.getElementById('unlock').onclick=()=>{
 };
 
 /* ============================ накопичення (ARQ через повтори) ============================ */
-let recv={map:new Map(), total:0, crc:0, len:0};
-function resetRecv(){recv={map:new Map(),total:0,crc:0,len:0};renderBlocks();document.getElementById('out').textContent='';setProg('');}
+let recv={map:new Map(), total:0, chunk:0, crc:0, len:0};
+function resetRecv(){recv={map:new Map(),total:0,chunk:0,crc:0,len:0};renderBlocks();document.getElementById('out').textContent='';setProg('');}
 function renderBlocks(){
   const el=document.getElementById('blocks'); el.innerHTML='';
   if(!recv.total){return;}
   for(let i=0;i<recv.total;i++){const d=document.createElement('div');d.className='blk'+(recv.map.has(i)?' got':'');el.appendChild(d);}
 }
 function ingestBlock(decoded){
-  if(!decoded||!decoded.ok)return false;
+  if(!decoded||!decoded.ok||!recv.chunk)return false;
   const plain=decoded.msg; const dv=new DataView(plain.buffer,plain.byteOffset,plain.byteLength);
   const idx=dv.getUint16(0,true), tot=dv.getUint16(2,true);
   if(tot<1||tot>4000||idx>=tot)return false;
   if(!recv.total)recv.total=tot;
   if(recv.total!==tot)return false;           // інший файл/режим — ігнор
   if(recv.map.has(idx))return false;
-  recv.map.set(idx, plain.slice(4,4+DATA()));
+  recv.map.set(idx, plain.slice(4,4+recv.chunk));
   return true;
 }
 function tryAssemble(){
-  if(!recv.total||recv.map.size<recv.total)return null;
-  const dlen=DATA(); const pay=new Uint8Array(recv.total*dlen);
+  if(!recv.total||!recv.chunk||recv.map.size<recv.total)return null;
+  const dlen=recv.chunk; const pay=new Uint8Array(recv.total*dlen);
   for(let i=0;i<recv.total;i++)pay.set(recv.map.get(i),i*dlen);
   const dv=new DataView(pay.buffer); const len=dv.getUint32(0,true), crc=dv.getUint32(4,true);
   if(len>pay.length-8)return {bad:true};
@@ -420,8 +428,8 @@ document.getElementById('send').onclick=async()=>{
     let bytes;
     if(txFile){bytes=txFile;}
     else{bytes=new TextEncoder().encode(document.getElementById('msg').value);}
-    const {blocks,nblk}=makeBlocks(bytes);
-    const pcm=buildSignal(blocks,sr);
+    const {header,blocks,nblk}=makeBlocks(bytes);
+    const pcm=buildSignal([header,...blocks],sr);
     const durS=pcm.length/sr;
     const netBps=bytes.length/durS, netbps=netBps*8;        // корисна швидкість (файл/час)
     const ab=ctx.createBuffer(1,pcm.length,sr);ab.getChannelData(0).set(pcm);
@@ -474,16 +482,24 @@ async function processRec(rec,sr){
   setProg('шукаю чирпи…'); await tick();
   const peaks=findPeaks(rec,sr);
   if(peaks.length) renderCarriers(rec,sr,peaks[0].p);    // видимий спектр несучих — які живі/глухі
-  setProg(`знайдено ${peaks.length} чирпів, декодую…`); await tick();
+  // ЗАГОЛОВОК першим: знайти чирп що декодується як 32Б-заголовок -> nblk, BN (розмір блоків даних)
+  let BN=0, hdrIdx=-1;
+  for(let i=0;i<peaks.length;i++){
+    const d=decodeUnit(rec,sr,peaks[i].p,HN,HPAR);
+    if(d&&d.ok){ const dv=new DataView(d.msg.buffer,d.msg.byteOffset,d.msg.byteLength);
+      const nb=dv.getUint16(0,true), bn=dv.getUint16(2,true);
+      if(nb>=1&&nb<=4000&&bn>=(4+cfg().parity)&&bn<=255){ BN=bn; recv.total=nb; recv.chunk=bn-4-cfg().parity; hdrIdx=i; break; } }
+  }
+  setProg(BN?`чирпів ${peaks.length}, BN=${BN}, декодую…`:`чирпів ${peaks.length}, ⚠ заголовок не зловлено`); await tick();
   let newOk=0, errs=[], fails=0;
-  for(let bi=0;bi<peaks.length;bi++){
-    const dec=decodeBlockAt(rec,sr,peaks[bi].p);
+  for(let bi=0; BN&&bi<peaks.length; bi++){
+    if(bi===hdrIdx) continue;
+    const dec=decodeUnit(rec,sr,peaks[bi].p,BN,cfg().parity);
     if(dec&&dec.ok)errs.push(dec.nerr);else fails++;
     if(ingestBlock(dec))newOk++;
     if(bi%2===0){ renderBlocks(); updCounts(newOk,fails,peaks.length,bi+1); await tick(); }  // живо + не вішає UI
   }
   renderBlocks(); updCounts(newOk,fails,peaks.length,peaks.length);
-  const seen=peaks.length;
   const have=recv.map.size, tot=recv.total;
   const dur=(rec.length/sr).toFixed(1);
   let peak=0; for(let i=0;i<rec.length;i++){const a=Math.abs(rec[i]);if(a>peak)peak=a;}
@@ -492,7 +508,7 @@ async function processRec(rec,sr){
   const cSig=peaks.length?carrierSig(rec,sr,peaks[0].p):'-';
   const sSig=specSig(rec,sr);
   // АУДІОСИГНАТУРА: дає ПОВНУ картину каналу навіть коли 0 блоків
-  const sig=`${VERSION}|${cfg().name} sr=${sr} dur=${dur}s pk=${peak.toFixed(3)} chirps=${peaks.length} sync=[${syncTop}] blk=${have}/${tot||'?'} +${newOk} fail=${fails} rsErr~${avgErr} | carr=${cSig} | spec=${sSig}`;
+  const sig=`${VERSION}|${cfg().name} sr=${sr} dur=${dur}s pk=${peak.toFixed(3)} chirps=${peaks.length} hdr=${BN?'BN'+BN:'НІ'} sync=[${syncTop}] blk=${have}/${tot||'?'} +${newOk} fail=${fails} rsErr~${avgErr} | carr=${cSig} | spec=${sSig}`;
   const asm=tryAssemble();
   if(asm&&!asm.bad){
     finish(asm);
@@ -500,7 +516,7 @@ async function processRec(rec,sr){
   }else{
     const miss=tot?(tot-have):'?';
     setProg(`блоків: ${have}/${tot||'?'} (+${newOk} з ${peaks.length} чирпів, ${fails} не декод.)`);
-    stat(tot?`не всі: лишилось ${miss}. ГРАЙ ЩЕ РАЗ той самий файл — блоки накопичаться.`:'жодного блока не зловлено — дивись сигнатуру/гучніше/ближче.','err');
+    stat(!BN?'⚠ заголовок не зловлено — грай ще раз (потрібен для розміру блоків).':(tot?`не всі: лишилось ${miss}. ГРАЙ ЩЕ РАЗ — блоки накопичаться.`:'жодного блока — дивись сигнатуру/гучніше.'),'err');
     tele('RX-part',sig);
   }
 }
@@ -525,14 +541,17 @@ document.getElementById('selftest').onclick=()=>{
   const sr=44100;
   resetRecv();
   const data=new Uint8Array(600); for(let i=0;i<data.length;i++)data[i]=(i*131+7)&255;
-  const {blocks,nblk}=makeBlocks(data);
-  let pcm=buildSignal(blocks,sr);
+  const {header,blocks,nblk}=makeBlocks(data);
+  let pcm=buildSignal([header,...blocks],sr);
   // канал: тихий шум + кліп — не валить RS
   const noisy=new Float32Array(pcm.length);
   let seed=12345; const rnd=()=>{seed=(seed*1103515245+12345)&0x7fffffff;return seed/0x7fffffff-0.5;};
   for(let i=0;i<pcm.length;i++)noisy[i]=pcm[i]+0.015*rnd();
   const peaks=findPeaks(noisy,sr);
-  let ok=0;for(const {p} of peaks){if(ingestBlock(decodeBlockAt(noisy,sr,p)))ok++;}
+  // заголовок першим -> BN -> блоки даних
+  let BN=0,hdrIdx=-1;
+  for(let i=0;i<peaks.length;i++){const d=decodeUnit(noisy,sr,peaks[i].p,HN,HPAR);if(d&&d.ok){const dv=new DataView(d.msg.buffer,d.msg.byteOffset,d.msg.byteLength);const nb=dv.getUint16(0,true),bn=dv.getUint16(2,true);if(nb>=1&&nb<=4000&&bn>=(4+cfg().parity)&&bn<=255){BN=bn;recv.total=nb;recv.chunk=bn-4-cfg().parity;hdrIdx=i;break;}}}
+  for(let i=0; BN&&i<peaks.length; i++){ if(i===hdrIdx)continue; ingestBlock(decodeUnit(noisy,sr,peaks[i].p,BN,cfg().parity)); }
   const asm=tryAssemble();
   renderBlocks();
   const pass=asm&&!asm.bad&&asm.len===data.length&&[...asm.file].every((b,i)=>b===data[i]);
