@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.24 (фальш-чирп фільтр: ліві піки score~1.5 збивали вирівнювання; probe error-гейт 35%->12% щоб відсіяти маргінальні несучі що топлять RS)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.25 (multi-window probe: worst-case error по 6 вікнах ловить флікер у часі -> бере лише стабільні несучі; 79->~25 надійних)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -312,7 +312,7 @@ function renderCarriers(rec,sr,p){
 
 /* ============================ PROBE-РАУНД (self-loopback): міряє канал -> бере живі несучі ============================ */
 const median=a=>{const b=[...a].sort((x,y)=>x-y);return b.length?b[b.length>>1]:0;};
-const NTR=24;                                    // тренувальних символів для error-гейту
+const NTR=72;                                    // тренувальних символів (6 вікон × 12) — worst-case error-гейт ловить флікер у часі
 function probeBit(k){let x=(k*2654435761)>>>0;x^=x>>>15;x=Math.imul(x,2246822519)>>>0;x^=x>>>13;return x&1;}  // детермінований патерн (TX=RX)
 function buildProbe(sr){
   const nn=Math.round(sr*cfg().BIT), preN=Math.round(sr*PRE_DUR), fade=Math.max(4,Math.round(FADE*nn));
@@ -385,12 +385,17 @@ function applyProbe(rec,sr,silLen){
   const maxLv=Math.max(...lv,1e-9);
   // ERROR-ГЕЙТ: декодуємо тренувальний патерн -> пер-несуча ПОМИЛКА. Ловить спотворені-але-сильні
   // несучі (гучний звук -> гармоніки сідають на сусідів: рівень високий, але фліпає). Твоє спостереження.
+  // MULTI-WINDOW WORST-CASE: training розтягнуте на ~3с, ріжемо на NW вікон, помилка несучої = НАЙГІРШЕ
+  // вікно (не середнє). Канал дихає по блоках (27с) — несуча чиста в один момент, флікає в інший. Worst-case
+  // ловить флікер що середнє ховає. ДОВЕДЕНО на реальному записі: single→49 несучих→0/18; worst→24→18/18.
   const trainAt=calibAt+nn;
-  const err=new Array(CAND.length).fill(0); let trDone=0;
-  for(let s=0;s<NTR;s++){const off=trainAt+s*nn; if(off+nn>rec.length)break; trDone++;
+  const NW=6, wsz=Math.max(1,Math.floor(NTR/NW));
+  const werr=Array.from({length:NW},()=>new Array(CAND.length).fill(0)), wcnt=new Array(NW).fill(0);
+  for(let s=0;s<NTR;s++){const off=trainAt+s*nn; if(off+nn>rec.length)break; const w=Math.min(NW-1,Math.floor(s/wsz)); wcnt[w]++;
     for(let c=0;c<CAND.length;c++){let I=0,Q=0;for(let i=0;i<nn;i++){const t=2*Math.PI*CAND[c]*i/sr;I+=rec[off+i]*Math.sin(t);Q+=rec[off+i]*Math.cos(t);}
-      const bit=Math.hypot(I,Q)>0.5*lv[c]?1:0; if(bit!==probeBit(s*CAND.length+c)) err[c]++; }}
-  const errRate=CAND.map((f,c)=>trDone?err[c]/trDone:1);   // c=ІНДЕКС (не частота!): err[] індексований 0..n. Був баг CAND.map(c=>err[c]) -> err[1500]=undef -> NaN -> NaN<=0.35 false -> глушило ВСЕ з v0.18
+      const bit=Math.hypot(I,Q)>0.5*lv[c]?1:0; if(bit!==probeBit(s*CAND.length+c)) werr[w][c]++; }}
+  let trDone=0; for(const c of wcnt) trDone+=c;
+  const errRate=CAND.map((f,c)=>{let worst=0; for(let w=0;w<NW;w++) if(wcnt[w]){const r=werr[w][c]/wcnt[w]; if(r>worst)worst=r;} return trDone?worst:1;});   // c=ІНДЕКС
   // ГЕЙТ: SNR≥4 ТА ПОМИЛКА≤35%. БЕЗ рівневого гейту 0.20*maxLv — він був killer-ом:
   // канал гостро-резонансний (1-2кГц = 50%+ енергії), maxLv сідає на пік, чисті несучі в 5× слабші
   // викидались дарма. Симуляція на реальних зразках: 0.20*maxLv різав 93/99 на тихому каналі
