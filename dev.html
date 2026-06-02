@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.26 (dual-детектор: magnitude-фолбек убиває фазову катастрофу битих блоків -> ARQ сходиться; probe строгіший ~36 несучих)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.27 (САМОНАВЧАННЯ: модем з успішних декодів вчить гнилі несучі і викидає їх на наступну передачу — твоя гіпотеза)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -113,7 +113,7 @@ function rsSynd(msg,nsym){const s=new Uint8Array(nsym);for(let i=0;i<nsym;i++)s[
 function rsLoc(synd){let el=[1],ol=[1];for(let i=0;i<synd.length;i++){let d=synd[i];for(let j=1;j<el.length;j++)d^=gfMul(el[el.length-1-j],synd[i-j]);ol=ol.concat([0]);if(d!==0){if(ol.length>el.length){const nl=pScale(ol,d);ol=pScale(el,gfInv(d));el=nl;}el=pAdd(el,pScale(ol,d));}}while(el.length&&el[0]===0)el.shift();return el;}
 function rsPos(el,nmess){const errs=el.length-1,pos=[];for(let i=0;i<255;i++){if(pEval(el,gfPow(2,i))===0){const cp=(255-i)%255,bi=(nmess-1)-cp;if(bi>=0&&bi<nmess)pos.push(bi);}}return pos.length===errs?pos:null;}
 function rsCorr(msg,synd,errPos){const cp=errPos.map(p=>msg.length-1-p);let el=[1];for(const p of cp)el=pMul(el,pAdd([1],[gfPow(2,p),0]));const sr=Array.from(synd).reverse();let ev=pMul(sr,el);ev=ev.slice(ev.length-el.length);const X=cp.map(p=>gfPow(2,p)),out=Uint8Array.from(msg);for(let i=0;i<X.length;i++){const xi=gfInv(X[i]);let den=1;for(let j=0;j<X.length;j++)if(j!==i)den=gfMul(den,1^gfMul(xi,X[j]));if(den===0)return null;out[errPos[i]]^=gfDiv(pEval(ev,xi),den);}return out;}
-function rsDecode(block,nsym){const msg=Uint8Array.from(block),synd=rsSynd(msg,nsym);let z=true;for(const s of synd)if(s!==0){z=false;break;}if(z)return{ok:true,msg:msg.slice(0,block.length-nsym),nerr:0};const el=rsLoc(synd),pos=rsPos(el,msg.length);if(!pos||pos.length>nsym/2)return{ok:false,msg:null,nerr:-1};const c=rsCorr(msg,synd,pos);if(!c)return{ok:false,msg:null,nerr:-1};const s2=rsSynd(c,nsym);for(const s of s2)if(s!==0)return{ok:false,msg:null,nerr:-1};return{ok:true,msg:c.slice(0,block.length-nsym),nerr:pos.length};}
+function rsDecode(block,nsym){const msg=Uint8Array.from(block),synd=rsSynd(msg,nsym);let z=true;for(const s of synd)if(s!==0){z=false;break;}if(z)return{ok:true,msg:msg.slice(0,block.length-nsym),nerr:0,full:msg};const el=rsLoc(synd),pos=rsPos(el,msg.length);if(!pos||pos.length>nsym/2)return{ok:false,msg:null,nerr:-1};const c=rsCorr(msg,synd,pos);if(!c)return{ok:false,msg:null,nerr:-1};const s2=rsSynd(c,nsym);for(const s of s2)if(s!==0)return{ok:false,msg:null,nerr:-1};return{ok:true,msg:c.slice(0,block.length-nsym),nerr:pos.length,full:c};}   // full=виправлений кодворд -> істина для навчання гнилих несучих
 
 /* ============================ КОНФІГ ============================ */
 const PRE_F0=1200, PRE_F1=3800, PRE_DUR=0.20;            // чирп-маячок: гострий пік кореляції
@@ -123,6 +123,7 @@ const FADE=0.12;
 let FREQS=[]; for(let f=700;f<=4500;f+=200) FREQS.push(f);
 let NCAR=FREQS.length;
 let GTX=FREQS.map(()=>1);
+const learnMap=new Map();   // freq -> [err,tot]: навчання гнилих несучих з УСПІШНИХ декодів (накопичується між проходами)
 // КАНДИДАТИ повної смуги для probe. Кидаємо ШИРОКО (до 20к, розблок до 23к) — probe сам відсіє мертві.
 // Стеля Найквіста: sr/2 (24к на 48k, 22к на 44.1k). UNLOCK тисне до краю.
 let CAND_HI=20000;
@@ -238,7 +239,7 @@ function decodeChirp(rec,sr,p){
       const BN=ch+4+parity;
       if(nsymOf(BN)*NCAR>bits.length) continue;
       const d=rsDecode(bitsToBytes(bits,BN),parity);
-      if(d&&d.ok){ d.BN=BN; d.chunk=ch; return d; }
+      if(d&&d.ok){ d.BN=BN; d.chunk=ch; d.rxBits=bits; return d; }   // rxBits -> порівняти з істиною (d.full) -> навчитись гнилих несучих
     }
   }
   return null;
@@ -422,7 +423,7 @@ function applyProbe(rec,sr,silLen){
   const amax=Math.max(...activeIdx.map(c=>lv[c]));
   FREQS=activeIdx.map(c=>CAND[c]);
   GTX=activeIdx.map(c=>Math.min(2.5,amax/Math.max(lv[c],1e-9)));   // помірний pre-emphasis (не воскрешати шум)
-  NCAR=FREQS.length; PROBED=true; resetRecv();
+  NCAR=FREQS.length; PROBED=true; learnMap.clear(); resetRecv();   // новий probe = новий канал -> скидаємо навчання гнилих несучих
   document.getElementById('probe').classList.add('on');
   const band=`${FREQS[0]}–${FREQS[FREQS.length-1]} Гц`;
   document.getElementById('probeinfo').textContent=`✓ ${NCAR} надійних несучих, смуга ${band}${distorted?` (${distorted} спотворених викинуто — пробуй тихіше для більшого)`:''}. ГРАТИ → адаптивно.`;
@@ -572,6 +573,24 @@ document.getElementById('sample').onclick=async()=>{
 };
 
 const tick=()=>new Promise(r=>setTimeout(r,0));
+// САМОНАВЧАННЯ: з виправленого блоку (d.full=істина) рахуємо пер-несучу помилку -> накопичуємо по ЧАСТОТІ
+function learnFrom(d){
+  if(!d.rxBits||!d.full) return;
+  const truth=bytesToBits(d.full);          // істинні передані біти
+  const L=Math.min(truth.length,d.rxBits.length);
+  for(let i=0;i<L;i++){const f=FREQS[i%NCAR]; const e=learnMap.get(f)||[0,0]; e[1]++; if(d.rxBits[i]!==truth[i])e[0]++; learnMap.set(f,e);}
+}
+// після проходу: викидаємо несучі що СТАБІЛЬНО биті (бачені достатньо + rate>поріг). Діє на НАСТУПНУ передачу.
+function dropBadCarriers(){
+  const BADR=0.05, MINSEEN=40;   // ≥40 спостережень (≈кілька блоків) і >5% помилок -> гнила
+  const bad=[];
+  for(let c=0;c<FREQS.length;c++){const e=learnMap.get(FREQS[c]); if(e&&e[1]>=MINSEEN&&e[0]/e[1]>BADR) bad.push(c);}
+  if(!bad.length||FREQS.length-bad.length<8) return 0;   // не лишай <8 несучих
+  const badF=bad.map(c=>FREQS[c]);
+  const keep=FREQS.map((f,c)=>!bad.includes(c));
+  FREQS=FREQS.filter((f,c)=>keep[c]); GTX=GTX.filter((g,c)=>keep[c]); NCAR=FREQS.length;
+  return badF;
+}
 function updCounts(newOk,fails,tot,done){
   const have=recv.map.size, T=recv.total;
   document.getElementById('counts').textContent=
@@ -585,7 +604,7 @@ async function processRec(rec,sr){
   let newOk=0, errs=[], fails=0;
   for(let bi=0;bi<peaks.length;bi++){
     const dec=decodeChirp(rec,sr,peaks[bi].p);   // незалежні блоки: пробуємо стандартні розміри
-    if(dec&&dec.ok)errs.push(dec.nerr);else fails++;
+    if(dec&&dec.ok){errs.push(dec.nerr); learnFrom(dec);}else fails++;   // вчимось гнилих несучих з виправленого блоку
     if(ingestBlock(dec))newOk++;
     if(bi%2===0){ renderBlocks(); updCounts(newOk,fails,peaks.length,bi+1); await tick(); }  // живо + не вішає UI
   }
@@ -607,7 +626,10 @@ async function processRec(rec,sr){
   }else{
     const miss=tot?(tot-have):'?';
     setProg(`блоків: ${have}/${tot||'?'} (+${newOk} з ${peaks.length} чирпів, ${fails} не декод.)`);
-    stat(tot?`не всі: лишилось ${miss}. ГРАЙ ЩЕ РАЗ — блоки накопичаться.`:'жодного блока — дивись сигнатуру/гучніше/ближче.','err');
+    const badF=dropBadCarriers();   // навчився з цього проходу -> викидаю гнилі несучі для НАСТУПНОЇ передачі
+    if(badF&&badF.length){
+      stat(`навчився: викинув ${badF.length} гнилих несучих (${badF.slice(0,4).join(',')}${badF.length>4?'…':''}Гц). ГРАЙ ЩЕ РАЗ — піде чистіше.`,'ok');
+    } else stat(tot?`не всі: лишилось ${miss}. ГРАЙ ЩЕ РАЗ — блоки накопичаться.`:'жодного блока — дивись сигнатуру/гучніше/ближче.','err');
     tele('RX-part',sig);
   }
 }
