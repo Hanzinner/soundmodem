@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.28 (файл: оцінка тривалості на вибір + гейт перед довгою побудовою — великий файл більше не морозить таб мовчки)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.29 (адаптивний гейт probe: послаблюється поки не набере робочий мінімум 16 несучих — більше не їде на 3)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -412,11 +412,25 @@ function applyProbe(rec,sr,silLen){
   const GATE=4, ERRMAX=0.08;   // worst-case 0 помилок у вікні (12 симв) => лише стабільне ядро ~36 несучих   // 35%->12%: byte-RS тоне якщо >~1.3% біт-BER. Маргінальні несучі (data-BER 8-50%)
                                // дають elevated training-error -> тісніший гейт відсіює їх ДО того як TX на них сяде.
                                // Доведено на реальному записі: 20/92 несучих псували RS; треба ~72 чистих.
-  const activeIdx=[]; for(let c=0;c<CAND.length;c++){ const snr=lv[c]/Math.max(noise[c],1e-9); if(snr>=GATE && errRate[c]<=ERRMAX) activeIdx.push(c); }
-  const distorted=CAND.filter((f,c)=>lv[c]/Math.max(noise[c],1e-9)>=GATE && errRate[c]>ERRMAX).length;
+  // АДАПТИВНИЙ ГЕЙТ: строгий поріг — це ЦІЛЬ, а не ультиматум. Якщо строго проходить надто мало,
+  // послаблюємо поки не набереться робочий мінімум. Інакше буває NCAR=3 (реальний випадок, fast-режим):
+  // формально "пройшло", а модем непрацездатний — 3 несучі це не канал.
+  const MINCAR=16;
+  const snrOf=c=>lv[c]/Math.max(noise[c],1e-9);
+  let activeIdx=[], usedErrmax=ERRMAX;
+  for(const em of [ERRMAX,0.15,0.25,0.4,0.6]){
+    activeIdx=[]; for(let c=0;c<CAND.length;c++) if(snrOf(c)>=GATE && errRate[c]<=em) activeIdx.push(c);
+    usedErrmax=em; if(activeIdx.length>=MINCAR) break;
+  }
+  if(activeIdx.length<MINCAR){   // навіть послаблений гейт не набрав -> беремо найкращі за помилкою серед чутних
+    const heard=[]; for(let c=0;c<CAND.length;c++) if(snrOf(c)>=GATE) heard.push(c);
+    heard.sort((a,b)=>errRate[a]-errRate[b]||snrOf(b)-snrOf(a));
+    if(heard.length>activeIdx.length) activeIdx=heard.slice(0,Math.min(MINCAR,heard.length));
+  }
+  const distorted=CAND.filter((f,c)=>snrOf(c)>=GATE && errRate[c]>usedErrmax).length;
   renderProbe(lv,noise,new Set(activeIdx));
   if(bv<20) document.getElementById('probeinfo').textContent=`⚠ слабкий синк зонда (${bv.toFixed(0)}) — вимір ненадійний, гучніше. `;
-  if(activeIdx.length<3){
+  if(activeIdx.length<8){   // <8 несучих = непрацездатно, краще чесно впасти ніж возити 3
     document.getElementById('probeinfo').textContent+=`канал майже глухий: ${activeIdx.length} несучих із SNR≥${GATE} (${distorted} спотворених). Зонд не почув достатньо — ближче мік до динаміка.`;
     stat('ПРОБ: канал майже глухий','err'); return;
   }
@@ -594,7 +608,7 @@ function dropBadCarriers(){
   const BADR=0.05, MINSEEN=40;   // ≥40 спостережень (≈кілька блоків) і >5% помилок -> гнила
   const bad=[];
   for(let c=0;c<FREQS.length;c++){const e=learnMap.get(FREQS[c]); if(e&&e[1]>=MINSEEN&&e[0]/e[1]>BADR) bad.push(c);}
-  if(!bad.length||FREQS.length-bad.length<8) return 0;   // не лишай <8 несучих
+  if(!bad.length||FREQS.length-bad.length<16) return 0;   // не лишай <16 несучих (нижче — модем непрацездатний)
   const badF=bad.map(c=>FREQS[c]);
   const keep=FREQS.map((f,c)=>!bad.includes(c));
   FREQS=FREQS.filter((f,c)=>keep[c]); GTX=GTX.filter((g,c)=>keep[c]); NCAR=FREQS.length;
