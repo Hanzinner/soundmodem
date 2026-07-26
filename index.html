@@ -49,6 +49,7 @@
   <div class="row">
     <button id="probe" class="tog">🎯 ПРОБ КАНАЛУ</button>
     <button id="unlock" class="tog">🔓 вищі частоти</button>
+    <button id="voice" class="tog">📞 ГОЛОСОВЕ</button>
   </div>
   <div class="carriers" id="probeview"></div>
   <div class="stat" id="probeinfo"></div>
@@ -60,6 +61,11 @@
     <button id="clrfile" class="alt" style="flex:1 1 25%; padding:8px; font-size:12px">× файл</button>
   </div>
   <div class="lbl" id="srcInfo" style="color:#9ca3af">надсилаю: <b>текст</b></div>
+  <div class="lbl">🔒 ПАРОЛЬ (порожньо = без шифрування). Тримай у голові — у сигналі його немає.</div>
+  <div class="row">
+    <input id="pass" type="password" placeholder="кодова фраза…" style="flex:1 1 60%; background:#141417; color:#e6e6e6; border:1px solid #2a2a30; border-radius:10px; padding:10px; font:inherit; font-size:14px">
+    <button id="decrypt" class="alt" style="flex:1 1 35%; padding:10px; font-size:12px">🔓 розшифрувати</button>
+  </div>
   <div class="row">
     <button id="send">▶ ГРАТИ ЗВУК</button>
   </div>
@@ -95,7 +101,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.29 (адаптивний гейт probe: послаблюється поки не набере робочий мінімум 16 несучих — більше не їде на 3)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.30 (шифрування AES-256-GCM з кодової фрази + голосовий режим 700-3400Гц що переживає кодек месенджера)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -126,8 +132,11 @@ let GTX=FREQS.map(()=>1);
 const learnMap=new Map();   // freq -> [err,tot]: навчання гнилих несучих з УСПІШНИХ декодів (накопичується між проходами)
 // КАНДИДАТИ повної смуги для probe. Кидаємо ШИРОКО (до 20к, розблок до 23к) — probe сам відсіє мертві.
 // Стеля Найквіста: sr/2 (24к на 48k, 22к на 44.1k). UNLOCK тисне до краю.
-let CAND_HI=20000;
-function buildCand(){ const a=[]; for(let f=300;f<=CAND_HI;f+=200) a.push(f); return a; }
+let CAND_HI=20000, VOICE=false;
+// ГОЛОСОВИЙ режим: несучі тільки в телефонній смузі 700-3400 з кроком 100 -> виживають у кодеку
+// голосових повідомлень (Opus/AMR ріже вище ~3.4-8к). Перевірено: широкі несучі при обрізанні
+// 3.4к гинуть, телефонні переживають обрізання + шум + AGC-компресію.
+function buildCand(){ const a=[]; if(VOICE){for(let f=700;f<=3400;f+=100)a.push(f);} else {for(let f=300;f<=CAND_HI;f+=200)a.push(f);} return a; }
 let CAND=buildCand();
 let PROBED=false;
 const GAP=0.12;                                          // тиша між блоками (було 0.25 — зрізав оверхед)
@@ -452,6 +461,12 @@ document.getElementById('unlock').onclick=()=>{
   document.getElementById('unlock').textContent = CAND_HI>20000 ? '🔓 до 23к' : '🔓 вищі частоти';
   stat(`кандидати до ${CAND_HI/1000}к. Натисни ПРОБ щоб перевиміряти.`);
 };
+document.getElementById('voice').onclick=()=>{
+  VOICE=!VOICE; CAND=buildCand(); FREQS=CAND.slice(); GTX=FREQS.map(()=>1); NCAR=FREQS.length; PROBED=false; learnMap.clear();
+  document.getElementById('voice').classList.toggle('on',VOICE);
+  document.getElementById('unlock').disabled=VOICE;
+  stat(VOICE?'📞 ГОЛОСОВЕ: несучі 700–3400 Гц — переживає кодек месенджера. Тисни ПРОБ.':'звичайний режим: широка смуга. Тисни ПРОБ.');
+};
 
 /* ============================ накопичення (ARQ через повтори) ============================ */
 let recv={map:new Map(), total:0, chunk:0, crc:0, len:0};
@@ -489,8 +504,31 @@ function setMode(m){MODE=m;document.getElementById('mFast').classList.toggle('on
 document.getElementById('mFast').onclick=()=>setMode('fast');
 document.getElementById('mSafe').onclick=()=>setMode('safe');
 
+/* ============================ КРИПТО (WebCrypto, без бібліотек) ============================ */
+// Шифруємо ДО модема: модем лишається тупою трубою. Формат: "HSC1"[4] salt[16] iv[12] ciphertext+tag.
+// PBKDF2-SHA256 600k -> AES-256-GCM. GCM дає і секретність, і автентичність (підробку не розшифрує).
+const CMAGIC=[72,83,67,49];   // "HSC1"
+const KDF_ITER=600000;
+async function deriveKey(pass,salt){
+  const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:KDF_ITER,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function encryptBytes(bytes,pass){
+  const salt=crypto.getRandomValues(new Uint8Array(16)), iv=crypto.getRandomValues(new Uint8Array(12));
+  const key=await deriveKey(pass,salt);
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,bytes));
+  const out=new Uint8Array(4+16+12+ct.length);
+  out.set(CMAGIC,0); out.set(salt,4); out.set(iv,20); out.set(ct,32);
+  return out;
+}
+const isEncrypted=b=>b.length>32&&CMAGIC.every((m,i)=>b[i]===m);
+async function decryptBytes(b,pass){
+  const salt=b.slice(4,20), iv=b.slice(20,32), ct=b.slice(32);
+  const key=await deriveKey(pass,salt);
+  return new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv},key,ct));   // кине помилку якщо пароль не той
+}
 /* ============================ TX ============================ */
-let txFile=null;
+let txFile=null, lastEnc=null;
 function setSrc(){
   const e=document.getElementById('srcInfo');
   if(txFile) e.innerHTML=`надсилаю: <b style="color:#f59e0b">ФАЙЛ ${txFile._name} ${txFile.length}B</b>`;
@@ -518,6 +556,9 @@ document.getElementById('send').onclick=async()=>{
     if(txFile){bytes=txFile;}
     else{bytes=new TextEncoder().encode(document.getElementById('msg').value);}
     if(!bytes.length){stat('нема що надсилати — впиши текст або обери файл.','err');return;}
+    const pw=document.getElementById('pass').value;
+    if(pw){ stat('шифрую (PBKDF2 600k — пару секунд)…'); await tick(); bytes=await encryptBytes(bytes,pw);
+            stat(`зашифровано: ${bytes.length}B (AES-256-GCM)`); await tick(); }
     const est=estDur(bytes,sr);
     if(est.sec>90 && !confirm(`Це ~${(est.sec/60).toFixed(1)} хв звуку (${est.nblk} блоків). Побудова може підвісити вкладку на кілька секунд. Продовжити?`)){stat('скасовано.');return;}
     stat(`будую сигнал (${est.nblk} блоків, ~${est.sec.toFixed(0)}с)…`); await tick();
@@ -644,7 +685,7 @@ async function processRec(rec,sr){
   LASTDIAG=sig;   // для meta.json при здачі зразка — щоб офлайн відтворити декод точно
   const asm=tryAssemble();
   if(asm&&!asm.bad){
-    finish(asm);
+    await finish(asm);
     tele('RX-OK',sig);
   }else{
     const miss=tot?(tot-have):'?';
@@ -656,11 +697,20 @@ async function processRec(rec,sr){
     tele('RX-part',sig);
   }
 }
-function finish(asm){
+async function finish(asm){
   renderBlocks();
+  const out=document.getElementById('out');
+  if(isEncrypted(asm.file)){                       // зашифроване -> потрібен пароль
+    const pw=document.getElementById('pass').value;
+    if(!pw){ out.textContent='🔒 зашифроване повідомлення — впиши пароль у поле вище і тисни «розшифрувати».';
+             setProg(`✓ ВСІ ${recv.total} блоків зібрані (зашифровано)`); stat('🔒 дані цілі, треба пароль','ok'); lastEnc=asm; return; }
+    stat('розшифровую…'); await tick();
+    try{ const plain=await decryptBytes(asm.file,pw); asm={...asm,file:plain,len:plain.length}; lastEnc=null; }
+    catch(e){ out.textContent='🔒 невірний пароль (або дані підроблені — GCM не пройшов автентифікацію).';
+              stat('невірний пароль','err'); lastEnc=asm; return; }
+  }
   let txt='';
   try{txt=new TextDecoder('utf-8',{fatal:true}).decode(asm.file);}catch(e){txt=null;}
-  const out=document.getElementById('out');
   if(txt!==null){out.textContent=txt;}
   else{
     const blob=new Blob([asm.file]); const url=URL.createObjectURL(blob);
@@ -691,6 +741,7 @@ document.getElementById('selftest').onclick=()=>{
   setProg(`самотест: ${nblk} блоків, чирпів знайдено ${peaks.length}, зловлено ${recv.map.size}/${nblk}`);
   stat(pass?`🧪 САМОТЕСТ ПРОЙДЕНО — ${data.length}B байт-у-байт через шум`:'🧪 САМОТЕСТ ВПАВ',pass?'ok':'err');
 };
+document.getElementById('decrypt').onclick=async()=>{ if(!lastEnc){stat('нема зашифрованого повідомлення — спершу прийми передачу.','err');return;} await finish(lastEnc); };
 document.getElementById('ver').textContent=VERSION;
 tele('DEVICE',`${UA} | екран ${screen.width}x${screen.height} | ${VERSION}`);   // хто/на чому — раз на сесію
 </script>
