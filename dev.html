@@ -95,7 +95,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.27 (САМОНАВЧАННЯ: модем з успішних декодів вчить гнилі несучі і викидає їх на наступну передачу — твоя гіпотеза)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.28 (файл: оцінка тривалості на вибір + гейт перед довгою побудовою — великий файл більше не морозить таб мовчки)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -482,7 +482,12 @@ function setSrc(){
   if(txFile) e.innerHTML=`надсилаю: <b style="color:#f59e0b">ФАЙЛ ${txFile._name} ${txFile.length}B</b>`;
   else e.innerHTML='надсилаю: <b>текст</b>';
 }
-document.getElementById('file').onchange=async e=>{const f=e.target.files[0];if(!f){txFile=null;setSrc();return;}txFile=new Uint8Array(await f.arrayBuffer());txFile._name=f.name;setSrc();stat(`файл обрано: ${f.name} ${txFile.length}B`);};
+// оцінка тривалості звуку БЕЗ побудови pcm (buildSignal синхронний і повільний ~130Б/с)
+function estDur(bytes,sr){sr=sr||48000;const n=Math.round(sr*cfg().BIT),preN=Math.round(sr*PRE_DUR);const {blocks}=makeBlocks(bytes);let s=0;for(const b of blocks)s+=preN+(1+nsymOf(b.length))*n;return{sec:s/sr,nblk:blocks.length};}
+document.getElementById('file').onchange=async e=>{const f=e.target.files[0];if(!f){txFile=null;setSrc();return;}txFile=new Uint8Array(await f.arrayBuffer());txFile._name=f.name;setSrc();
+  const {sec,nblk}=estDur(txFile);const mm=sec>=60?`${(sec/60).toFixed(1)} хв`:`${sec.toFixed(0)}с`;
+  const warn=sec>90?' ⚠ довго — таб може підвиснути на побудові':'';
+  stat(`файл: ${f.name} ${txFile.length}B → ${nblk} блоків, ~${mm} звуку${warn}`, sec>90?'err':'');};
 document.getElementById('clrfile').onclick=()=>{txFile=null;document.getElementById('file').value='';setSrc();stat('файл прибрано — надсилатиму текст.');};
 // друкуєш текст -> файл скидається (інакше шле старий файл, не текст: причина "ієрогліфів")
 document.getElementById('msg').addEventListener('input',()=>{ if(txFile){txFile=null;document.getElementById('file').value='';setSrc();} });
@@ -498,6 +503,10 @@ document.getElementById('send').onclick=async()=>{
     let bytes;
     if(txFile){bytes=txFile;}
     else{bytes=new TextEncoder().encode(document.getElementById('msg').value);}
+    if(!bytes.length){stat('нема що надсилати — впиши текст або обери файл.','err');return;}
+    const est=estDur(bytes,sr);
+    if(est.sec>90 && !confirm(`Це ~${(est.sec/60).toFixed(1)} хв звуку (${est.nblk} блоків). Побудова може підвісити вкладку на кілька секунд. Продовжити?`)){stat('скасовано.');return;}
+    stat(`будую сигнал (${est.nblk} блоків, ~${est.sec.toFixed(0)}с)…`); await tick();
     const {blocks,nblk}=makeBlocks(bytes);
     const pcm=buildSignal(blocks,sr);
     const durS=pcm.length/sr;
