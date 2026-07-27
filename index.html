@@ -66,6 +66,8 @@
     <input id="pass" type="password" placeholder="кодова фраза…" style="flex:1 1 60%; background:#141417; color:#e6e6e6; border:1px solid #2a2a30; border-radius:10px; padding:10px; font:inherit; font-size:14px">
     <button id="decrypt" class="alt" style="flex:1 1 35%; padding:10px; font-size:12px">🔓 розшифрувати</button>
   </div>
+  <div class="lbl">МІЦНІСТЬ — скільки часу коштує ОДНА спроба підбору (тобі теж стільки чекати, раз)</div>
+  <div class="row"><select id="kdf" style="flex:1 1 100%; background:#141417; color:#e6e6e6; border:1px solid #2a2a30; border-radius:10px; padding:10px; font:inherit; font-size:13px"></select></div>
   <div class="row">
     <button id="send">▶ ГРАТИ ЗВУК</button>
   </div>
@@ -101,7 +103,7 @@
 
 <script>
 "use strict";
-const VERSION="web-dev v0.30 (шифрування AES-256-GCM з кодової фрази + голосовий режим 700-3400Гц що переживає кодек месенджера)";   // ЄДИНЕ джерело версії
+const VERSION="web-dev v0.31 (вибір міцності шифру: 200k-6М перемелів, число їде в заголовку — приймач підхоплює сам)";   // ЄДИНЕ джерело версії
 /* ============================ Reed-Solomon GF(256), 0x11d (перевірено в node) ============================ */
 const GF_EXP=new Uint8Array(512), GF_LOG=new Uint8Array(256);
 (function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255];})();
@@ -507,24 +509,30 @@ document.getElementById('mSafe').onclick=()=>setMode('safe');
 /* ============================ КРИПТО (WebCrypto, без бібліотек) ============================ */
 // Шифруємо ДО модема: модем лишається тупою трубою. Формат: "HSC1"[4] salt[16] iv[12] ciphertext+tag.
 // PBKDF2-SHA256 600k -> AES-256-GCM. GCM дає і секретність, і автентичність (підробку не розшифрує).
-const CMAGIC=[72,83,67,49];   // "HSC1"
-const KDF_ITER=600000;
-async function deriveKey(pass,salt){
+const CMAGIC=[72,83,67,49];   // "HSC1" (старий формат: 600k жорстко)
+const CMAGIC2=[72,83,67,50];  // "HSC2": + число перемелів у заголовку (приймач мусить робити стільки ж)
+const KDF_PRESETS=[[200000,'швидко ~0.3с'],[600000,'звичайно ~1с'],[2000000,'міцно ~3с'],[6000000,'параноя ~10с']];
+let KDF_ITER=600000;
+async function deriveKey(pass,salt,iter){
   const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
-  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:KDF_ITER,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:iter||KDF_ITER,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
 }
 async function encryptBytes(bytes,pass){
   const salt=crypto.getRandomValues(new Uint8Array(16)), iv=crypto.getRandomValues(new Uint8Array(12));
-  const key=await deriveKey(pass,salt);
+  const key=await deriveKey(pass,salt,KDF_ITER);
   const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,bytes));
-  const out=new Uint8Array(4+16+12+ct.length);
-  out.set(CMAGIC,0); out.set(salt,4); out.set(iv,20); out.set(ct,32);
+  const out=new Uint8Array(4+4+16+12+ct.length);
+  out.set(CMAGIC2,0); new DataView(out.buffer).setUint32(4,KDF_ITER,true);   // число перемелів НЕ секретне
+  out.set(salt,8); out.set(iv,24); out.set(ct,36);
   return out;
 }
-const isEncrypted=b=>b.length>32&&CMAGIC.every((m,i)=>b[i]===m);
+const isEncrypted=b=>(b.length>32&&CMAGIC.every((m,i)=>b[i]===m))||(b.length>36&&CMAGIC2.every((m,i)=>b[i]===m));
 async function decryptBytes(b,pass){
-  const salt=b.slice(4,20), iv=b.slice(20,32), ct=b.slice(32);
-  const key=await deriveKey(pass,salt);
+  const v2=CMAGIC2.every((m,i)=>b[i]===m);
+  const iter=v2?new DataView(b.buffer,b.byteOffset).getUint32(4,true):600000;
+  const o=v2?8:4;
+  const salt=b.slice(o,o+16), iv=b.slice(o+16,o+28), ct=b.slice(o+28);
+  const key=await deriveKey(pass,salt,iter);
   return new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv},key,ct));   // кине помилку якщо пароль не той
 }
 /* ============================ TX ============================ */
@@ -741,6 +749,9 @@ document.getElementById('selftest').onclick=()=>{
   setProg(`самотест: ${nblk} блоків, чирпів знайдено ${peaks.length}, зловлено ${recv.map.size}/${nblk}`);
   stat(pass?`🧪 САМОТЕСТ ПРОЙДЕНО — ${data.length}B байт-у-байт через шум`:'🧪 САМОТЕСТ ВПАВ',pass?'ok':'err');
 };
+(function(){const sel=document.getElementById('kdf');
+  KDF_PRESETS.forEach(([n,lbl])=>{const o=document.createElement('option');o.value=n;o.textContent=`${lbl} — ${(n/1000)|0}k перемелів`;if(n===KDF_ITER)o.selected=true;sel.appendChild(o);});
+  sel.onchange=()=>{KDF_ITER=+sel.value;stat(`міцність: ${(KDF_ITER/1000)|0}k перемелів на спробу`);};})();
 document.getElementById('decrypt').onclick=async()=>{ if(!lastEnc){stat('нема зашифрованого повідомлення — спершу прийми передачу.','err');return;} await finish(lastEnc); };
 document.getElementById('ver').textContent=VERSION;
 tele('DEVICE',`${UA} | екран ${screen.width}x${screen.height} | ${VERSION}`);   // хто/на чому — раз на сесію

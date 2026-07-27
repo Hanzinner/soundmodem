@@ -3,7 +3,7 @@ const fs=require('fs');
 const {webcrypto}=require('crypto');
 let script=fs.readFileSync(__dirname+'/web/dev.html','utf8').split('<script>')[1].split('</script>')[0];
 const elP=new Proxy(function(){},{get:(t,k)=>{if(k==='classList')return{toggle(){},add(){},remove(){}};if(k==='style')return{};if(k==='textContent')return'';if(k==='value')return'';return elP;},set:()=>true,apply:()=>elP});
-script+='\n;module.exports={encryptBytes,decryptBytes,isEncrypted,makeBlocks,buildSignal,findPeaks,decodeChirp,ingestBlock,tryAssemble,resetRecv,setMode};';
+script+='\n;module.exports={setIter:(n)=>{KDF_ITER=n;},encryptBytes,decryptBytes,isEncrypted,makeBlocks,buildSignal,findPeaks,decodeChirp,ingestBlock,tryAssemble,resetRecv,setMode};';
 const mod={exports:{}};
 new Function('module','exports','document','fetch','window','TextEncoder','TextDecoder','Blob','URL','screen','navigator','setTimeout','crypto',script)
 (mod,mod.exports,{getElementById:()=>elP,createElement:()=>elP,body:{appendChild(){},removeChild(){}}},()=>{},{},TextEncoder,TextDecoder,class{},{createObjectURL:()=>'',revokeObjectURL(){}},{width:0,height:0},{userAgent:'node'},f=>f&&f(),webcrypto);
@@ -37,5 +37,16 @@ const M=mod.exports,SR=48000;
   let caught=false;
   try{await M.decryptBytes(tamp,pass);}catch(e){caught=true;}
   console.log('підробка байта:',caught?'✓ СПІЙМАНО (GCM автентифікація)':'✗✗ ПРОПУЩЕНО');
-  process.exit(txt===secret&&rejected&&caught?0:1);
+  // різні рівні міцності: приймач має взяти число перемелів із заголовка
+  let allOk=true;
+  for(const it of [200000,2000000]){
+    M.setIter(it);
+    const e2=await M.encryptBytes(data,pass);
+    M.setIter(600000);                       // приймач НЕ знає що обрав відправник
+    const t0=Date.now(); let ok2=false;
+    try{const p2=await M.decryptBytes(e2,pass);ok2=new TextDecoder().decode(p2)===secret;}catch(e){}
+    console.log(`міцність ${(it/1000)|0}k -> розшифровано іншим налаштуванням: ${ok2?'✓':'✗ ПРОВАЛ'} (${Date.now()-t0}ms)`);
+    allOk=allOk&&ok2;
+  }
+  process.exit(txt===secret&&rejected&&caught&&allOk?0:1);
 })();
